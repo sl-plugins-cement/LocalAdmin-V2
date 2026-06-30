@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Globalization;
 using System.IO;
 using LocalAdmin.V2.IO.Logging;
@@ -12,6 +12,10 @@ public static class ConsoleUtil
     private static readonly object Lck = new object();
 
     private static string? _liveTimestampPadding, _logsTimestampPadding;
+
+    // Optional sink that mirrors every displayed console line to the
+    // headless command channel for read-back. Set by LocalAdmin when the channel starts.
+    internal static Action<string>? OutputSink;
 
     public static void Clear()
     {
@@ -103,6 +107,20 @@ public static class ConsoleUtil
         }
     }
 
+    /// <summary>
+    /// Mirrors a console line to the command-channel read-back sink (if any). Best-effort and
+    /// never throws back into the caller; invoked outside the console lock by WriteLine.
+    /// </summary>
+    private static void MirrorToSink(string content)
+    {
+        var sink = OutputSink;
+        if (sink == null)
+            return;
+
+        try { sink(content); }
+        catch { /* read-back must never break console output */ }
+    }
+
     public static void WriteLine(string? content, ConsoleColor color = ConsoleColor.White, int height = 0, bool log = true, bool display = true)
     {
         lock (Lck)
@@ -132,5 +150,9 @@ public static class ConsoleUtil
             if (log)
                 Logger.Log($"{GetLogsTimestamp()} {(multiline ? content.Replace("\n", GetLogsPadding(), StringComparison.Ordinal) : content)}");
         }
+
+        // Outside the console lock: fan the displayed text out to the read-back sink.
+        if (display)
+            MirrorToSink(content);
     }
 }

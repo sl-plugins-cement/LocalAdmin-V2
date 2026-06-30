@@ -8,9 +8,13 @@ internal sealed class RestartCommand : CommandBase
 
     internal override void Execute(string[] arguments)
     {
-        Core.LocalAdmin.Singleton!.DisableExitActionSignals = true;
-        Core.LocalAdmin.Singleton.ExitAction = Core.LocalAdmin.ShutdownAction.Restart;
-        if (Core.LocalAdmin.Singleton.Server is { Connected: true })
-            Core.LocalAdmin.Singleton.Server.WriteLine("exit");
+        var localAdmin = Core.LocalAdmin.Singleton!;
+
+        localAdmin.ClaimExitAction(Core.LocalAdmin.ShutdownAction.Restart);
+
+        if (localAdmin.Server is { Connected: true } && localAdmin.Server.WriteLine("exit"))
+            return;
+
+        localAdmin.ForceScheduledRestart("manual restart command");
     }
 }

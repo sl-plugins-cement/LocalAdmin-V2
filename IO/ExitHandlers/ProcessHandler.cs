@@ -19,8 +19,7 @@ internal sealed class ProcessHandler : IExitHandler
         if (Core.LocalAdmin.Singleton == null)
             return;
 
-        Core.LocalAdmin.Singleton.DisableExitActionSignals = true;
-        Core.LocalAdmin.Singleton.ExitAction = Core.LocalAdmin.ShutdownAction.SilentShutdown;
+        Core.LocalAdmin.Singleton.ClaimExitAction(Core.LocalAdmin.ShutdownAction.SilentShutdown);
         Core.LocalAdmin.Singleton.Exit(0);
     }
 }

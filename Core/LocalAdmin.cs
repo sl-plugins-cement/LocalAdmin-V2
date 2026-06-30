@@ -13,6 +13,8 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using LocalAdmin.V2.Commands.PluginManager;
+using LocalAdmin.V2.Core.CommandChannel;
+using LocalAdmin.V2.Core.Policy;
 using LocalAdmin.V2.IO.Logging;
 using LocalAdmin.V2.PluginsManager;
 
@@ -55,6 +57,14 @@ public sealed class LocalAdmin : IDisposable
     private Task? _readerTask, _heartbeatMonitoringTask;
     private static int? _processId;
 
+    // Enhanced fork: headless command channel + restart-when-empty watchdog.
+    private static CommandChannelServer? _commandChannel;
+    private readonly PlayerCountTracker _playerTracker = new();
+    private readonly object _oneShotRestartWhenEmptyLock = new();
+    private CancellationTokenSource? _policyCts;
+    private CancellationTokenSource? _oneShotRestartWhenEmptyCts;
+    private RestartWhenEmptyOptions? _oneShotRestartWhenEmptyOptions;
+
     internal static readonly Stopwatch HeartbeatStopwatch = new();
     internal static LocalAdmin? Singleton;
     internal static ushort GamePort;
@@ -69,8 +79,12 @@ public sealed class LocalAdmin : IDisposable
         (_processId.HasValue ? $" | PID: {_processId}" : string.Empty);
     internal static bool NoSetCursor, PrintControlMessages, AutoFlush = true, EnableLogging = true, NoPadding, DismissPluginsSecurityWarning;
 
-    internal ShutdownAction ExitAction = ShutdownAction.Crash;
-    internal bool DisableExitActionSignals;
+    // volatile: these two form a cross-thread exit-decision protocol mutated from the reader,
+    // heartbeat monitor, TCP receive loop, OS exit handlers and the restart-when-empty
+    // watchdog. Volatile reads/writes give the watchdog reliable visibility of an exit claim
+    // (DisableExitActionSignals) set by another thread without a shared lock.
+    internal volatile ShutdownAction ExitAction = ShutdownAction.Crash;
+    internal volatile bool DisableExitActionSignals;
     internal HeartbeatStatus CurrentHeartbeatStatus = HeartbeatStatus.Disabled;
     internal uint HeartbeatWarningStage;
 
@@ -538,10 +552,15 @@ public sealed class LocalAdmin : IDisposable
                 _exit = false;
                 _firstRun = false;
                 SetupKeyboardInput();
+                StartCommandChannel();
             }
 
             RegisterCommands();
             SetupReader();
+
+            // Fresh per-session player-count state, then arm the restart-when-empty watchdog.
+            _playerTracker.Reset();
+            StartRestartWhenEmptyPolicy();
 
             StartSession();
 
@@ -678,7 +697,11 @@ public sealed class LocalAdmin : IDisposable
             if (!byte.TryParse(line.AsSpan(0, 1), NumberStyles.HexNumber, null, out var colorValue))
                 colorValue = (byte)ConsoleColor.Gray;
 
-            ConsoleUtil.WriteLine(line[1..], (ConsoleColor)colorValue);
+            var stripped = line[1..];
+            ConsoleUtil.WriteLine(stripped, (ConsoleColor)colorValue);
+
+            // Fan out: feed the restart-when-empty tracker and the command-channel read-back.
+            OnConsoleLine(stripped);
         };
         Server.Start();
     }
@@ -697,6 +720,76 @@ public sealed class LocalAdmin : IDisposable
                 InputQueue.Enqueue(input);
             }
         }).Start();
+    }
+
+    private static void StartCommandChannel()
+    {
+        if (Configuration is not { CommandChannelEnabled: true })
+        {
+            StopCommandChannel();
+            return;
+        }
+
+        if (_commandChannel != null)
+        {
+            var configuredPipeName = CommandChannelServer.BuildPipeName(Configuration.CommandChannelPipeName, GamePort);
+            if (string.Equals(_commandChannel.PipeName, configuredPipeName, StringComparison.Ordinal))
+            {
+                ConsoleUtil.OutputSink = line => _commandChannel?.Broadcast(line);
+                return;
+            }
+
+            StopCommandChannel();
+        }
+
+        try
+        {
+            _commandChannel = new CommandChannelServer(
+                Configuration.CommandChannelPipeName,
+                GamePort,
+                line => InputQueue.Enqueue(line));
+            _commandChannel.Start();
+
+            // Mirror displayed console output to connected pipe clients for read-back.
+            ConsoleUtil.OutputSink = line => _commandChannel?.Broadcast(line);
+        }
+        catch (Exception ex)
+        {
+            ConsoleUtil.WriteLine($"Failed to start command channel: {ex.Message}. Continuing without it.", ConsoleColor.Yellow);
+            _commandChannel?.Stop();
+            _commandChannel = null;
+            ConsoleUtil.OutputSink = null;
+        }
+    }
+
+    private static void StopCommandChannel()
+    {
+        ConsoleUtil.OutputSink = null;
+        _commandChannel?.Stop();
+        _commandChannel = null;
+    }
+
+    private void StartRestartWhenEmptyPolicy()
+    {
+        if (Configuration is not { AutoRestartEmptyEnabled: true })
+            return;
+
+        // Cancel any watchdog left over from a previous session and start a fresh one bound
+        // to this session's token, so a stale watchdog can never act on the new session.
+        try { _policyCts?.Cancel(); }
+        catch { /* ignore */ }
+        _policyCts?.Dispose();
+        _policyCts = new CancellationTokenSource();
+
+        try
+        {
+            var policy = new RestartWhenEmptyPolicy(this, _playerTracker, Configuration);
+            policy.Start(_policyCts.Token);
+        }
+        catch (Exception ex)
+        {
+            ConsoleUtil.WriteLine($"Failed to start restart-when-empty watchdog: {ex.Message}.", ConsoleColor.Yellow);
+        }
     }
 
     private void SetupReader()
@@ -762,8 +855,7 @@ public sealed class LocalAdmin : IDisposable
 
                 if (input.Equals("exit", StringComparison.OrdinalIgnoreCase) || input.StartsWith("exit ", StringComparison.OrdinalIgnoreCase) || input.Equals("quit", StringComparison.OrdinalIgnoreCase) || input.StartsWith("quit ", StringComparison.OrdinalIgnoreCase) || input.Equals("stop", StringComparison.OrdinalIgnoreCase) || input.StartsWith("stop ", StringComparison.OrdinalIgnoreCase))
                 {
-                    DisableExitActionSignals = true;
-                    ExitAction = ShutdownAction.SilentShutdown;
+                    ClaimExitAction(ShutdownAction.SilentShutdown);
                     exit = true;
                 }
 
@@ -785,10 +877,18 @@ public sealed class LocalAdmin : IDisposable
 
     private void RunScpsl()
     {
-        if (File.Exists(_scpslExecutable))
+        if (ServerApplicationLocator.TryLocate(
+                _scpslExecutable,
+                Configuration!.ServerApplicationPath,
+                CurrentConfigPath,
+                out var serverApplication,
+                out var attemptedPaths))
         {
-            ConsoleUtil.WriteLine("Executing: " + _scpslExecutable, ConsoleColor.DarkGreen);
-            var printStd = Configuration!.LaShowStdoutStderr || _stdPrint;
+            ConsoleUtil.WriteLine("Executing: " + serverApplication!.ExecutablePath, ConsoleColor.DarkGreen);
+            ConsoleUtil.WriteLine("Server application source: " + serverApplication.Source, ConsoleColor.DarkGreen);
+            ConsoleUtil.WriteLine("Server working directory: " + serverApplication.WorkingDirectory, ConsoleColor.DarkGreen);
+
+            var printStd = Configuration.LaShowStdoutStderr || _stdPrint;
             var redirectStreams =
                 Configuration.LaLogStdoutStderr || printStd;
 
@@ -802,9 +902,10 @@ public sealed class LocalAdmin : IDisposable
 
             var startInfo = new ProcessStartInfo
             {
-                FileName = _scpslExecutable,
+                FileName = serverApplication.ExecutablePath,
                 Arguments =
                     $"-batchmode -nographics -txbuffer {Configuration.SlToLaBufferSize} -rxbuffer {Configuration.LaToSlBufferSize} -port{GamePort} -console{Server!.ConsolePort} -id{Environment.ProcessId}{extraArgs} {_gameArguments}",
+                WorkingDirectory = serverApplication.WorkingDirectory,
                 CreateNoWindow = true,
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
@@ -889,9 +990,12 @@ public sealed class LocalAdmin : IDisposable
         else
         {
             ConsoleUtil.WriteLine("Failed - Server application could not be located!", ConsoleColor.Red);
+            ConsoleUtil.WriteLine("Attempted server application paths:", ConsoleColor.Red);
 
-            DisableExitActionSignals = true;
-            ExitAction = ShutdownAction.Shutdown;
+            foreach (var attemptedPath in attemptedPaths)
+                ConsoleUtil.WriteLine("- " + attemptedPath, ConsoleColor.Red);
+
+            ClaimExitAction(ShutdownAction.Shutdown);
 
             if (OperatingSystem.IsWindows())
                 Exit((int)WindowsErrorCode.ERROR_FILE_NOT_FOUND, true);
@@ -907,6 +1011,7 @@ public sealed class LocalAdmin : IDisposable
         CommandService.RegisterCommand(new HeartbeatCancelCommand());
         CommandService.RegisterCommand(new HeartbeatControlCommand());
         CommandService.RegisterCommand(new RestartCommand());
+        CommandService.RegisterCommand(new RestartWhenEmptyCommand());
         CommandService.RegisterCommand(new ForceRestartCommand());
         CommandService.RegisterCommand(new HelpCommand());
         CommandService.RegisterCommand(new LicenseCommand());
@@ -952,6 +1057,13 @@ public sealed class LocalAdmin : IDisposable
 
             _exit = true;
             _processClosing = true;
+
+            // Stop this session's restart-when-empty watchdog so it cannot act on the next
+            // session (which resets the static _exit flag back to false).
+            try { _policyCts?.Cancel(); }
+            catch { /* ignore */ }
+            CancelOneShotRestartWhenEmptySilently();
+
             LogCleaner.Abort();
             Logger.EndLogging();
             TerminateGame(); // Forcefully terminating the process
@@ -985,6 +1097,9 @@ public sealed class LocalAdmin : IDisposable
 
             if (ExitAction == ShutdownAction.Crash && Configuration is { RestartOnCrash: true })
                 return;
+
+            // Real process termination (not a restart): tear down the process-wide channel.
+            StopCommandChannel();
 
             if (waitForKey && ExitAction != ShutdownAction.SilentShutdown)
             {
@@ -1052,8 +1167,7 @@ public sealed class LocalAdmin : IDisposable
 
     private void Terminate()
     {
-        DisableExitActionSignals = true;
-        ExitAction = ShutdownAction.SilentShutdown;
+        ClaimExitAction(ShutdownAction.SilentShutdown);
         Exit(1);
     }
 
@@ -1062,6 +1176,281 @@ public sealed class LocalAdmin : IDisposable
         Console.WriteLine("exit");
         InputQueue.Enqueue("exit");
     }
+
+    internal bool TryStartOneShotRestartWhenEmpty(
+        int restartAtOrBelowPlayers,
+        int emptyConfirmations,
+        int tickSeconds,
+        int recentActivityOverPlayers,
+        int recentActivityWindowMinutes,
+        out string message)
+    {
+        if (restartAtOrBelowPlayers < 0)
+        {
+            message = "restart-at-or-below players must be 0 or higher.";
+            return false;
+        }
+
+        if (emptyConfirmations < 1)
+        {
+            message = "confirmations must be 1 or higher.";
+            return false;
+        }
+
+        if (tickSeconds < 1)
+        {
+            message = "tick seconds must be 1 or higher.";
+            return false;
+        }
+
+        if (recentActivityOverPlayers < 0)
+        {
+            message = "recent-activity player threshold must be 0 or higher.";
+            return false;
+        }
+
+        if (recentActivityWindowMinutes < 0)
+        {
+            message = "recent-activity window minutes must be 0 or higher.";
+            return false;
+        }
+
+        lock (_oneShotRestartWhenEmptyLock)
+        {
+            if (_processClosing || _exit)
+            {
+                message = "Cannot arm one-shot restart-when-empty while LocalAdmin is shutting down.";
+                return false;
+            }
+
+            if (_oneShotRestartWhenEmptyCts != null)
+            {
+                message = "One-shot restart-when-empty is already armed. Run \"restartwhenempty cancel\" before arming a new one.";
+                return false;
+            }
+
+            var options = RestartWhenEmptyOptions.OneShot(
+                restartAtOrBelowPlayers,
+                emptyConfirmations,
+                tickSeconds,
+                recentActivityOverPlayers,
+                recentActivityWindowMinutes);
+            var cts = new CancellationTokenSource();
+
+            try
+            {
+                var policy = new RestartWhenEmptyPolicy(this, _playerTracker, options);
+                policy.Start(cts.Token);
+            }
+            catch (Exception ex)
+            {
+                cts.Dispose();
+                message = $"Failed to arm one-shot restart-when-empty: {ex.Message}.";
+                return false;
+            }
+
+            _oneShotRestartWhenEmptyCts = cts;
+            _oneShotRestartWhenEmptyOptions = options;
+            message = $"One-shot restart-when-empty armed. {options.Summary}";
+            return true;
+        }
+    }
+
+    internal bool TryCancelOneShotRestartWhenEmpty(out string message)
+    {
+        lock (_oneShotRestartWhenEmptyLock)
+        {
+            if (_oneShotRestartWhenEmptyCts == null)
+            {
+                message = "One-shot restart-when-empty is not armed.";
+                return false;
+            }
+
+            try { _oneShotRestartWhenEmptyCts.Cancel(); }
+            catch { /* ignore */ }
+            _oneShotRestartWhenEmptyCts.Dispose();
+            _oneShotRestartWhenEmptyCts = null;
+            _oneShotRestartWhenEmptyOptions = null;
+
+            message = "One-shot restart-when-empty canceled.";
+            return true;
+        }
+    }
+
+    internal string GetOneShotRestartWhenEmptyStatus()
+    {
+        RestartWhenEmptyOptions? options;
+        lock (_oneShotRestartWhenEmptyLock)
+        {
+            options = _oneShotRestartWhenEmptyOptions;
+        }
+
+        if (options == null)
+            return "One-shot restart-when-empty is not armed.";
+
+        var playerStatus = "not ready";
+        if (_playerTracker.IsReady)
+            playerStatus = _playerTracker.TryGetKnownCount(out var players)
+                ? players.ToString(CultureInfo.InvariantCulture)
+                : "unknown while server is non-idle";
+
+        return $"One-shot restart-when-empty is armed. {options.Summary} Current player count: {playerStatus}.";
+    }
+
+    private void CancelOneShotRestartWhenEmptySilently()
+    {
+        lock (_oneShotRestartWhenEmptyLock)
+        {
+            if (_oneShotRestartWhenEmptyCts == null)
+                return;
+
+            try { _oneShotRestartWhenEmptyCts.Cancel(); }
+            catch { /* ignore */ }
+            _oneShotRestartWhenEmptyCts.Dispose();
+            _oneShotRestartWhenEmptyCts = null;
+            _oneShotRestartWhenEmptyOptions = null;
+        }
+    }
+
+    /// <summary>
+    /// Performs or retries a graceful restart (the RestartCommand pattern) for an automated trigger.
+    /// The storm-guard bypass (<see cref="_ignoreNextRestart"/>) is NOT armed here: Exit()
+    /// already sets it atomically under its lifecycle lock at the moment it commits to a
+    /// ShutdownAction.Restart, so arming early would let an interleaving crash/shutdown
+    /// consume the bypass for the wrong restart. The Program loop relaunches via Restart.
+    /// </summary>
+    internal bool RequestScheduledRestart(string reason)
+    {
+        // Coordinate with Exit() via the same lifecycle lock. If the process is already
+        // closing (a real shutdown/crash won the race, or a stale watchdog from a previous
+        // session fired late), the restart request is already terminal from the caller's
+        // perspective - we must not resurrect or re-target a teardown.
+        lock (this)
+        {
+            if (_processClosing || _exit)
+                return true;
+
+            // Defer to any authoritative exit decision already in flight. The heartbeat
+            // crash path, the console exit/quit/stop handler, and Terminate() all set
+            // DisableExitActionSignals=true the instant they claim the shutdown (heartbeat
+            // does so just before setting _exit, leaving a tiny window where _exit is still
+            // false). If that flag is already set, something else owns the exit - we must NOT
+            // overwrite its ExitAction (which would, e.g., misclassify a crash as a graceful
+            // restart and wrongly arm the storm-guard bypass).
+            if (DisableExitActionSignals && ExitAction != ShutdownAction.Restart)
+                return false;
+
+            var firstRequest = !DisableExitActionSignals || ExitAction != ShutdownAction.Restart;
+
+            DisableExitActionSignals = true;
+            ExitAction = ShutdownAction.Restart;
+
+            ConsoleUtil.WriteLine(
+                firstRequest
+                    ? $"Scheduled restart requested ({reason})."
+                    : $"Scheduled restart retry requested ({reason}).",
+                ConsoleColor.Cyan);
+
+            var server = Server;
+            if (server is { Connected: true })
+            {
+                if (server.WriteLine("exit"))
+                    return true;
+
+                ConsoleUtil.WriteLine("Scheduled restart could not send graceful exit command; falling back to LocalAdmin-controlled restart.", ConsoleColor.Yellow);
+            }
+
+            // No live game connection, or the graceful command could not be sent: unblock
+            // the main loop; the ExitAction.Restart path will terminate the game and relaunch.
+            _exit = true;
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Forces a scheduled restart after the graceful game-side exit command failed to
+    /// complete. This keeps the same restart-storm guard bypass semantics as
+    /// <see cref="RequestScheduledRestart"/>.
+    /// </summary>
+    internal bool ForceScheduledRestart(string reason)
+    {
+        lock (this)
+        {
+            if (_processClosing || _exit)
+                return true;
+
+            if (DisableExitActionSignals && ExitAction != ShutdownAction.Restart)
+                return false;
+
+            DisableExitActionSignals = true;
+            ExitAction = ShutdownAction.Restart;
+
+            ConsoleUtil.WriteLine($"Scheduled restart fallback forcing game process termination ({reason}).", ConsoleColor.Yellow);
+        }
+
+        Exit(0, restart: true);
+        return true;
+    }
+
+    private void ClaimHeartbeatRestart()
+    {
+        lock (this)
+        {
+            if (_processClosing || _exit)
+                return;
+
+            if (!DisableExitActionSignals)
+            {
+                DisableExitActionSignals = true;
+                ExitAction = ShutdownAction.Crash;
+            }
+
+            _exit = true;
+        }
+    }
+
+    internal bool TryApplyGameExitAction(ShutdownAction action)
+    {
+        lock (this)
+        {
+            if (DisableExitActionSignals)
+                return false;
+
+            ExitAction = action;
+            return true;
+        }
+    }
+
+    internal void ClaimExitAction(ShutdownAction action)
+    {
+        lock (this)
+        {
+            if (_processClosing)
+                return;
+
+            DisableExitActionSignals = true;
+            ExitAction = action;
+        }
+    }
+
+    internal void OnConsoleLine(string strippedLine)
+    {
+        // Feed the player-count tracker (restart-when-empty). The command-channel read-back
+        // is driven separately via ConsoleUtil.OutputSink so it also captures LocalAdmin's
+        // own console output (help, errors, the ">>> input" echo), not just game lines.
+        try
+        {
+            _playerTracker.ProcessConsoleLine(strippedLine);
+        }
+        catch
+        {
+            // tracker must never break console output
+        }
+    }
+
+    internal void NotifyIdleEnter() => _playerTracker.NotifyIdleEnter();
+
+    internal void NotifyIdleExit() => _playerTracker.NotifyIdleExit();
 
     internal void HandleHeartbeat()
     {
@@ -1147,10 +1536,7 @@ public sealed class LocalAdmin : IDisposable
                             ConsoleUtil.WriteLine("Game server has probably crashed. Restarting the server...", ConsoleColor.Red);
                             HeartbeatStopwatch.Reset();
 
-                            DisableExitActionSignals = true;
-                            ExitAction = ShutdownAction.Crash;
-
-                            _exit = true;
+                            ClaimHeartbeatRestart();
                             return;
                         }
 

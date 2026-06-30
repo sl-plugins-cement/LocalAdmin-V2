@@ -8,7 +8,8 @@ internal sealed class ForceRestartCommand : CommandBase
 
     internal override void Execute(string[] arguments)
     {
-        Core.LocalAdmin.Singleton!.ExitAction = Core.LocalAdmin.ShutdownAction.Restart;
-        Core.LocalAdmin.Singleton.Exit(0, restart: true);
+        var localAdmin = Core.LocalAdmin.Singleton!;
+        localAdmin.ClaimExitAction(Core.LocalAdmin.ShutdownAction.Restart);
+        localAdmin.Exit(0, restart: true);
     }
 }

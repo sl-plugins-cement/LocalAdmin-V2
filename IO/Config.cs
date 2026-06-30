@@ -32,7 +32,18 @@ public class Config
     public int LaToSlBufferSize = 25000;
     public int SlToLaBufferSize = 200000;
 
+    // Enhanced fork additions: headless command channel + restart-when-empty.
+    public bool CommandChannelEnabled;
+    public bool AutoRestartEmptyEnabled;
+    public int RestartAtOrBelowPlayers = 1;
+    public int EmptyConfirmations = 2;
+    public int PolicyTickSeconds = 30;
+    public int RecentActivityOverPlayers = 5;
+    public int RecentActivityWindowMinutes = 30;
+
     public string LaLiveViewTimeFormat = "yyyy-MM-dd HH:mm:ss.fff zzz";
+    public string CommandChannelPipeName = "LocalAdmin-Console";
+    public string ServerApplicationPath = string.Empty;
 
     public string SerializeConfig()
     {
@@ -106,6 +117,33 @@ public class Config
 
         sb.Append("sl_to_la_buffer_size: ");
         sb.AppendLine(SlToLaBufferSize.ToString());
+
+        sb.Append("command_channel_enabled: ");
+        sb.AppendLine(CommandChannelEnabled.ToString().ToLowerInvariant());
+
+        sb.Append("command_channel_pipe_name: ");
+        sb.AppendLine(CommandChannelPipeName);
+
+        sb.Append("server_application_path: ");
+        sb.AppendLine(ServerApplicationPath);
+
+        sb.Append("auto_restart_empty_enabled: ");
+        sb.AppendLine(AutoRestartEmptyEnabled.ToString().ToLowerInvariant());
+
+        sb.Append("restart_at_or_below_players: ");
+        sb.AppendLine(RestartAtOrBelowPlayers.ToString());
+
+        sb.Append("empty_confirmations: ");
+        sb.AppendLine(EmptyConfirmations.ToString());
+
+        sb.Append("policy_tick_seconds: ");
+        sb.AppendLine(PolicyTickSeconds.ToString());
+
+        sb.Append("recent_activity_over_players: ");
+        sb.AppendLine(RecentActivityOverPlayers.ToString());
+
+        sb.Append("recent_activity_window_minutes: ");
+        sb.AppendLine(RecentActivityWindowMinutes.ToString());
 
         return sb.ToString();
     }
@@ -220,6 +258,53 @@ public class Config
                         b = 351;
                     cfg.SlToLaBufferSize = b;
                     break;
+
+                case "command_channel_enabled" when bool.TryParse(sp[1], out var b):
+                    cfg.CommandChannelEnabled = b;
+                    break;
+
+                case "command_channel_pipe_name":
+                    if (!string.IsNullOrWhiteSpace(sp[1]))
+                        cfg.CommandChannelPipeName = sp[1].Trim();
+                    break;
+
+                case "server_application_path":
+                    cfg.ServerApplicationPath = sp[1].Trim();
+                    break;
+
+                case "auto_restart_empty_enabled" when bool.TryParse(sp[1], out var b):
+                    cfg.AutoRestartEmptyEnabled = b;
+                    break;
+
+                case "restart_at_or_below_players" when int.TryParse(sp[1], out var b):
+                    if (b < 0)
+                        b = 0;
+                    cfg.RestartAtOrBelowPlayers = b;
+                    break;
+
+                case "empty_confirmations" when int.TryParse(sp[1], out var b):
+                    if (b < 1)
+                        b = 1;
+                    cfg.EmptyConfirmations = b;
+                    break;
+
+                case "policy_tick_seconds" when int.TryParse(sp[1], out var b):
+                    if (b < 1)
+                        b = 1;
+                    cfg.PolicyTickSeconds = b;
+                    break;
+
+                case "recent_activity_over_players" when int.TryParse(sp[1], out var b):
+                    if (b < 0)
+                        b = 0;
+                    cfg.RecentActivityOverPlayers = b;
+                    break;
+
+                case "recent_activity_window_minutes" when int.TryParse(sp[1], out var b):
+                    if (b < 0)
+                        b = 0;
+                    cfg.RecentActivityWindowMinutes = b;
+                    break;
             }
 
             if (!cfg.EnableLaLogs || cfg.LaLogsExpirationDays == 0)
@@ -283,6 +368,30 @@ public class Config
             sb.AppendLine(" days");
         }
         else sb.AppendLine("- Do not compress old round logs.");
+
+        sb.AppendLine(CommandChannelEnabled
+            ? $"- Command channel (named pipe \"{CommandChannelPipeName}-<port>\") is ENABLED."
+            : "- Command channel (named pipe) is DISABLED.");
+
+        sb.AppendLine(string.IsNullOrWhiteSpace(ServerApplicationPath)
+            ? "- Server application path is not configured; LocalAdmin will auto-discover it."
+            : $"- Server application path is configured as: {ServerApplicationPath}");
+
+        if (AutoRestartEmptyEnabled)
+        {
+            sb.Append("- Auto restart-when-empty is ENABLED (restart at or below ");
+            sb.Append(RestartAtOrBelowPlayers);
+            sb.Append(" players after ");
+            sb.Append(EmptyConfirmations);
+            sb.Append(" confirmations, polling every ");
+            sb.Append(PolicyTickSeconds);
+            sb.Append("s, blocked if the last ");
+            sb.Append(RecentActivityWindowMinutes);
+            sb.Append(" minutes peaked above ");
+            sb.Append(RecentActivityOverPlayers);
+            sb.AppendLine(" players).");
+        }
+        else sb.AppendLine("- Auto restart-when-empty is DISABLED.");
 
         return sb.ToString();
     }

@@ -139,30 +139,28 @@ public class TcpServer
 
                                 case OutputCodes.IdleEnter:
                                     LocalAdmin.Singleton?.SetIdleModeState(true);
+                                    LocalAdmin.Singleton?.NotifyIdleEnter();
                                     break;
 
                                 case OutputCodes.IdleExit:
                                     LocalAdmin.Singleton?.SetIdleModeState(false);
+                                    LocalAdmin.Singleton?.NotifyIdleExit();
                                     break;
 
                                 case OutputCodes.ExitActionReset:
-                                    if (!LocalAdmin.Singleton!.DisableExitActionSignals)
-                                        LocalAdmin.Singleton.ExitAction = LocalAdmin.ShutdownAction.Crash;
+                                    LocalAdmin.Singleton!.TryApplyGameExitAction(LocalAdmin.ShutdownAction.Crash);
                                     break;
 
                                 case OutputCodes.ExitActionShutdown:
-                                    if (!LocalAdmin.Singleton!.DisableExitActionSignals)
-                                        LocalAdmin.Singleton.ExitAction = LocalAdmin.ShutdownAction.Shutdown;
+                                    LocalAdmin.Singleton!.TryApplyGameExitAction(LocalAdmin.ShutdownAction.Shutdown);
                                     break;
 
                                 case OutputCodes.ExitActionSilentShutdown:
-                                    if (!LocalAdmin.Singleton!.DisableExitActionSignals)
-                                        LocalAdmin.Singleton.ExitAction = LocalAdmin.ShutdownAction.SilentShutdown;
+                                    LocalAdmin.Singleton!.TryApplyGameExitAction(LocalAdmin.ShutdownAction.SilentShutdown);
                                     break;
 
                                 case OutputCodes.ExitActionRestart:
-                                    if (!LocalAdmin.Singleton!.DisableExitActionSignals)
-                                        LocalAdmin.Singleton.ExitAction = LocalAdmin.ShutdownAction.Restart;
+                                    LocalAdmin.Singleton!.TryApplyGameExitAction(LocalAdmin.ShutdownAction.Restart);
                                     break;
 
                                 case OutputCodes.Heartbeat:
@@ -188,34 +186,49 @@ public class TcpServer
             if (_exit)
                 return;
             _exit = true;
+            Connected = false;
 
             _listener.Stop();
             _client?.Close();
         }
     }
 
-    public void WriteLine(string input)
+    public bool WriteLine(string input)
     {
         lock (_lck)
         {
-            if (_exit) return;
+            if (_exit || !Connected || _networkStream == null)
+                return false;
+
             const int offset = sizeof(int);
 
             var buffer = ArrayPool<byte>.Shared.Rent(Encoding.UTF8.GetMaxByteCount(input.Length) + offset);
 
-            var length = _encoding.GetBytes(input, 0, input.Length, buffer, offset);
-
-            if (length + offset > _txBuffer)
+            try
             {
-                ConsoleUtil.WriteLine("Failed to send command - configured LA to SL buffer size is too small. Please increase it in the LocalAdmin config file to run this command!", ConsoleColor.Red);
-                ArrayPool<byte>.Shared.Return(buffer);
-                return;
+                var length = _encoding.GetBytes(input, 0, input.Length, buffer, offset);
+
+                if (length + offset > _txBuffer)
+                {
+                    ConsoleUtil.WriteLine("Failed to send command - configured LA to SL buffer size is too small. Please increase it in the LocalAdmin config file to run this command!", ConsoleColor.Red);
+                    return false;
+                }
+
+                MemoryMarshal.Write(buffer, length);
+
+                _networkStream.Write(buffer, 0, length + offset);
+                return true;
             }
-
-            MemoryMarshal.Write(buffer, length);
-
-            _networkStream!.Write(buffer, 0, length + offset);
-            ArrayPool<byte>.Shared.Return(buffer);
+            catch (Exception ex)
+            {
+                Connected = false;
+                ConsoleUtil.WriteLine($"Failed to send command - TCP write failed: {ex.Message}", ConsoleColor.Yellow);
+                return false;
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
         }
     }
 }
