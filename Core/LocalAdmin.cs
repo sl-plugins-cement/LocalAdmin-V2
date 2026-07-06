@@ -60,10 +60,38 @@ public sealed class LocalAdmin : IDisposable
     // Enhanced fork: headless command channel + restart-when-empty watchdog.
     private static CommandChannelServer? _commandChannel;
     private readonly PlayerCountTracker _playerTracker = new();
-    private readonly object _oneShotRestartWhenEmptyLock = new();
     private CancellationTokenSource? _policyCts;
     private CancellationTokenSource? _oneShotRestartWhenEmptyCts;
-    private RestartWhenEmptyOptions? _oneShotRestartWhenEmptyOptions;
+
+    // One-shot restart intents that must survive an in-process session restart (Program.cs creates
+    // a fresh LocalAdmin per session), so they are re-armed each session by RearmPendingOneShots().
+    // Cleared when the intent fires or is explicitly cancelled - NOT on an unrelated restart.
+    private static readonly object OneShotIntentLock = new();
+    private static OneShotLowActivityIntent? _pendingOneShotLowActivity;
+    private static RoundRestartIntent? _pendingRoundRestart;
+
+    // True while NotifyRoundRestart is committing the round-restart intent (between deciding to
+    // fire and consuming the intent). Cancel must fail during this window - otherwise it clears
+    // the intent, reports success, and the restart happens anyway.
+    private static bool _roundRestartFiring;
+
+    // Per-session: the game emits a RoundRestart byte for the initial round too; skip that one so
+    // "restart on next round restart" fires on a real round transition, not on server boot.
+    private bool _sawInitialRoundRestart;
+
+    private sealed record OneShotLowActivityIntent(
+        int RestartAtOrBelowPlayers,
+        int EmptyConfirmations,
+        int TickSeconds,
+        int RecentActivityOverPlayers,
+        int RecentActivityWindowMinutes,
+        int DurationSeconds);
+
+    private sealed class RoundRestartIntent
+    {
+        internal RoundRestartIntent(int roundsRemaining) => RoundsRemaining = roundsRemaining;
+        internal int RoundsRemaining;
+    }
 
     internal static readonly Stopwatch HeartbeatStopwatch = new();
     internal static LocalAdmin? Singleton;
@@ -439,7 +467,7 @@ public sealed class LocalAdmin : IDisposable
                             break;
 
                         case CaptureArgs.RestartsTimeWindow:
-                            if (!int.TryParse(arg, out _restartsTimeWindow) || _restartsLimit < 0)
+                            if (!int.TryParse(arg, out _restartsTimeWindow) || _restartsTimeWindow < 0)
                             {
                                 _restartsTimeWindow = 480;
                                 ConsoleUtil.WriteLine("restartsTimeWindow argument value must be an integer greater or equal to 0.", ConsoleColor.Red);
@@ -518,6 +546,7 @@ public sealed class LocalAdmin : IDisposable
                 ConfigWizard.RunConfigWizard(useDefault);
 
             NoSetCursor |= Configuration!.LaNoSetCursor;
+            DisableCursorManagementIfConsoleUnavailable();
             AutoFlush &= Configuration.LaLogAutoFlush;
             EnableLogging &= Configuration.EnableLaLogs;
 
@@ -561,6 +590,9 @@ public sealed class LocalAdmin : IDisposable
             // Fresh per-session player-count state, then arm the restart-when-empty watchdog.
             _playerTracker.Reset();
             StartRestartWhenEmptyPolicy();
+
+            // Re-arm any one-shot restart intents carried over from a previous session.
+            RearmPendingOneShots();
 
             StartSession();
 
@@ -809,17 +841,7 @@ public sealed class LocalAdmin : IDisposable
                 if (string.IsNullOrWhiteSpace(input))
                     continue;
 
-                var currentLineCursor = NoSetCursor ? 0 : Console.CursorTop;
-
-                if (currentLineCursor > 0)
-                {
-                    Console.SetCursorPosition(0, currentLineCursor - 1);
-
-                    ConsoleUtil.WriteLine($"{string.Empty.PadLeft(Console.WindowWidth)}>>> {input}", ConsoleColor.DarkMagenta, -1);
-                    Console.SetCursorPosition(0, currentLineCursor);
-                }
-                else
-                    ConsoleUtil.WriteLine($">>> {input}", ConsoleColor.DarkMagenta, -1);
+                EchoInput(input);
 
                 if (!_processRefreshFail && _gameProcess != null)
                 {
@@ -860,7 +882,13 @@ public sealed class LocalAdmin : IDisposable
                 }
 
                 if (Server.Connected)
+                {
+                    // Correlate a manually typed "players" command with its list reply so the
+                    // tracker accepts it (unsolicited list-shaped lines are untrusted).
+                    if (name == "PLAYERS")
+                        _playerTracker.NotePlayersPollIssued();
                     Server.WriteLine(input);
+                }
                 else
                     ConsoleUtil.WriteLine("Failed to send command - connection to server process hasn't been established yet.", ConsoleColor.Yellow);
 
@@ -873,6 +901,69 @@ public sealed class LocalAdmin : IDisposable
         }
 
         _readerTask = new Task(ReaderTaskMethod);
+    }
+
+    private static void DisableCursorManagementIfConsoleUnavailable()
+    {
+        if (NoSetCursor)
+            return;
+
+        if (Console.IsOutputRedirected || !CanUseConsoleCursor())
+            NoSetCursor = true;
+    }
+
+    private static bool CanUseConsoleCursor()
+    {
+        try
+        {
+            _ = Console.CursorTop;
+            _ = Console.WindowWidth;
+            return true;
+        }
+        catch (Exception ex) when (IsConsoleCursorUnavailable(ex))
+        {
+            return false;
+        }
+    }
+
+    private static void EchoInput(string input)
+    {
+        if (TryEchoInputAtCurrentCursor(input))
+            return;
+
+        ConsoleUtil.WriteLine($">>> {input}", ConsoleColor.DarkMagenta, -1);
+    }
+
+    private static bool TryEchoInputAtCurrentCursor(string input)
+    {
+        if (NoSetCursor)
+            return false;
+
+        var wroteInput = false;
+
+        try
+        {
+            var currentLineCursor = Console.CursorTop;
+            if (currentLineCursor <= 0)
+                return false;
+
+            var windowWidth = Console.WindowWidth;
+            Console.SetCursorPosition(0, currentLineCursor - 1);
+            ConsoleUtil.WriteLine($"{string.Empty.PadLeft(windowWidth)}>>> {input}", ConsoleColor.DarkMagenta, -1);
+            wroteInput = true;
+            Console.SetCursorPosition(0, currentLineCursor);
+            return true;
+        }
+        catch (Exception ex) when (IsConsoleCursorUnavailable(ex))
+        {
+            NoSetCursor = true;
+            return wroteInput;
+        }
+    }
+
+    private static bool IsConsoleCursorUnavailable(Exception ex)
+    {
+        return ex is IOException or PlatformNotSupportedException or InvalidOperationException or ArgumentOutOfRangeException;
     }
 
     private void RunScpsl()
@@ -1012,6 +1103,7 @@ public sealed class LocalAdmin : IDisposable
         CommandService.RegisterCommand(new HeartbeatControlCommand());
         CommandService.RegisterCommand(new RestartCommand());
         CommandService.RegisterCommand(new RestartWhenEmptyCommand());
+        CommandService.RegisterCommand(new RestartNextRoundCommand());
         CommandService.RegisterCommand(new ForceRestartCommand());
         CommandService.RegisterCommand(new HelpCommand());
         CommandService.RegisterCommand(new LicenseCommand());
@@ -1062,7 +1154,7 @@ public sealed class LocalAdmin : IDisposable
             // session (which resets the static _exit flag back to false).
             try { _policyCts?.Cancel(); }
             catch { /* ignore */ }
-            CancelOneShotRestartWhenEmptySilently();
+            StopOneShotWatchdogForSessionEnd();
 
             LogCleaner.Abort();
             Logger.EndLogging();
@@ -1177,12 +1269,62 @@ public sealed class LocalAdmin : IDisposable
         InputQueue.Enqueue("exit");
     }
 
+    /// <summary>
+    /// Best-effort request for a fresh authoritative player count: sends the <c>players</c> command
+    /// to the game console (its "List of players (N):" reply is parsed by PlayerCountTracker).
+    /// No-op if the console connection is not up yet.
+    /// </summary>
+    internal void RequestPlayerCountRefresh()
+    {
+        var server = Server;
+        if (server is { Connected: true })
+        {
+            _playerTracker.NotePlayersPollIssued();
+            server.WriteLine("players");
+        }
+    }
+
+    // A graceful restart has already been committed (someone owns the ShutdownAction.Restart and its
+    // retry/force fallback). Arming a new one-shot now must be refused so it cannot cancel the live
+    // watchdog that owns that fallback - the intent would re-arm in the next session anyway.
+    private bool RestartInProgress => DisableExitActionSignals && ExitAction == ShutdownAction.Restart;
+
+    /// <summary>
+    /// Claims a graceful restart and, when committed, arms a background force-fallback so a stalled
+    /// game-side exit is still forced after ~60s (the restart-when-empty watchdog has this via its
+    /// tick loop; direct callers like restart-on-next-round need it too). The fallback is bound to
+    /// THIS session via the instance <see cref="_processClosing"/> flag - a fresh session gets a
+    /// fresh instance - so it can never act on a later session. Returns true iff a Restart was
+    /// actually claimed.
+    /// </summary>
+    private bool TryScheduleGracefulRestartWithForceFallback(string reason)
+    {
+        if (!RequestScheduledRestart(reason) || ExitAction != ShutdownAction.Restart)
+            return false;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
+
+                // If this session hasn't started tearing down, the graceful exit stalled - force it.
+                if (!_processClosing)
+                    ForceScheduledRestart($"{reason}; graceful exit stalled");
+            }
+            catch { /* fallback is best-effort; never surface */ }
+        });
+
+        return true;
+    }
+
     internal bool TryStartOneShotRestartWhenEmpty(
         int restartAtOrBelowPlayers,
         int emptyConfirmations,
         int tickSeconds,
         int recentActivityOverPlayers,
         int recentActivityWindowMinutes,
+        int durationSeconds,
         out string message)
     {
         if (restartAtOrBelowPlayers < 0)
@@ -1215,7 +1357,14 @@ public sealed class LocalAdmin : IDisposable
             return false;
         }
 
-        lock (_oneShotRestartWhenEmptyLock)
+        if (durationSeconds < 0)
+        {
+            message = "duration seconds must be 0 or higher.";
+            return false;
+        }
+
+        OneShotLowActivityIntent intent;
+        lock (OneShotIntentLock)
         {
             if (_processClosing || _exit)
             {
@@ -1223,94 +1372,367 @@ public sealed class LocalAdmin : IDisposable
                 return false;
             }
 
-            if (_oneShotRestartWhenEmptyCts != null)
+            if (RestartInProgress)
+            {
+                message = "A server restart is already in progress; arm again after the server restarts.";
+                return false;
+            }
+
+            if (_pendingOneShotLowActivity != null)
             {
                 message = "One-shot restart-when-empty is already armed. Run \"restartwhenempty cancel\" before arming a new one.";
                 return false;
             }
 
-            var options = RestartWhenEmptyOptions.OneShot(
+            intent = new OneShotLowActivityIntent(
                 restartAtOrBelowPlayers,
                 emptyConfirmations,
                 tickSeconds,
                 recentActivityOverPlayers,
-                recentActivityWindowMinutes);
-            var cts = new CancellationTokenSource();
+                recentActivityWindowMinutes,
+                durationSeconds);
+            _pendingOneShotLowActivity = intent;
+        }
 
-            try
+        if (!TryArmLiveOneShotLowActivity(intent, out var options, out var error))
+        {
+            lock (OneShotIntentLock)
+                _pendingOneShotLowActivity = null;
+
+            message = error;
+            return false;
+        }
+
+        // The pre-arm shutdown check above runs under OneShotIntentLock, but Exit() flips
+        // _processClosing under the lifecycle lock - an arm can pass that check before Exit and
+        // publish its live watchdog after Exit's teardown already ran. Re-check under the
+        // lifecycle lock now that the CTS is published: if a shutdown won the race, tear the
+        // watchdog back down instead of leaking an orphan bound to this dying session.
+        lock (this)
+        {
+            if (_processClosing || _exit)
             {
-                var policy = new RestartWhenEmptyPolicy(this, _playerTracker, options);
-                policy.Start(cts.Token);
-            }
-            catch (Exception ex)
-            {
-                cts.Dispose();
-                message = $"Failed to arm one-shot restart-when-empty: {ex.Message}.";
+                StopLiveOneShotLowActivity();
+                lock (OneShotIntentLock)
+                {
+                    if (ReferenceEquals(_pendingOneShotLowActivity, intent))
+                        _pendingOneShotLowActivity = null;
+                }
+
+                message = "Cannot arm one-shot restart-when-empty while LocalAdmin is shutting down.";
                 return false;
             }
-
-            _oneShotRestartWhenEmptyCts = cts;
-            _oneShotRestartWhenEmptyOptions = options;
-            message = $"One-shot restart-when-empty armed. {options.Summary}";
-            return true;
         }
+
+        message = $"One-shot restart-when-empty armed. {options!.Summary} It persists across unrelated restarts until it fires or is canceled.";
+        return true;
     }
 
     internal bool TryCancelOneShotRestartWhenEmpty(out string message)
     {
-        lock (_oneShotRestartWhenEmptyLock)
+        bool wasArmed;
+        lock (OneShotIntentLock)
         {
-            if (_oneShotRestartWhenEmptyCts == null)
-            {
-                message = "One-shot restart-when-empty is not armed.";
-                return false;
-            }
-
-            try { _oneShotRestartWhenEmptyCts.Cancel(); }
-            catch { /* ignore */ }
-            _oneShotRestartWhenEmptyCts.Dispose();
-            _oneShotRestartWhenEmptyCts = null;
-            _oneShotRestartWhenEmptyOptions = null;
-
-            message = "One-shot restart-when-empty canceled.";
-            return true;
+            wasArmed = _pendingOneShotLowActivity != null;
+            _pendingOneShotLowActivity = null;
         }
+
+        if (!wasArmed)
+        {
+            // Nothing armed to cancel. Crucially, DON'T stop the live watchdog here: if the one-shot
+            // already fired, that live policy is now committing the restart and owns the retry/force
+            // fallback - cancelling it would let a stalled graceful exit hang.
+            message = RestartInProgress
+                ? "A one-shot restart-when-empty has already committed a restart; it can no longer be canceled."
+                : "One-shot restart-when-empty is not armed.";
+            return false;
+        }
+
+        // Armed but not yet fired -> tear down the live watchdog.
+        StopLiveOneShotLowActivity();
+        message = "One-shot restart-when-empty canceled.";
+        return true;
     }
 
     internal string GetOneShotRestartWhenEmptyStatus()
     {
-        RestartWhenEmptyOptions? options;
-        lock (_oneShotRestartWhenEmptyLock)
-        {
-            options = _oneShotRestartWhenEmptyOptions;
-        }
+        OneShotLowActivityIntent? intent;
+        lock (OneShotIntentLock)
+            intent = _pendingOneShotLowActivity;
 
-        if (options == null)
+        if (intent == null)
             return "One-shot restart-when-empty is not armed.";
 
-        var playerStatus = "not ready";
-        if (_playerTracker.IsReady)
-            playerStatus = _playerTracker.TryGetKnownCount(out var players)
-                ? players.ToString(CultureInfo.InvariantCulture)
-                : "unknown while server is non-idle";
+        var options = RestartWhenEmptyOptions.OneShot(
+            intent.RestartAtOrBelowPlayers,
+            intent.EmptyConfirmations,
+            intent.TickSeconds,
+            intent.RecentActivityOverPlayers,
+            intent.RecentActivityWindowMinutes,
+            intent.DurationSeconds);
+
+        var playerStatus = _playerTracker.IsReady && _playerTracker.TryGetKnownCount(out var players)
+            ? players.ToString(CultureInfo.InvariantCulture)
+            : "not ready";
 
         return $"One-shot restart-when-empty is armed. {options.Summary} Current player count: {playerStatus}.";
     }
 
-    private void CancelOneShotRestartWhenEmptySilently()
+    /// <summary>Re-arms one-shot intents carried over from a previous in-process session.</summary>
+    private void RearmPendingOneShots()
     {
-        lock (_oneShotRestartWhenEmptyLock)
+        OneShotLowActivityIntent? low;
+        RoundRestartIntent? round;
+        lock (OneShotIntentLock)
         {
-            if (_oneShotRestartWhenEmptyCts == null)
-                return;
+            low = _pendingOneShotLowActivity;
+            round = _pendingRoundRestart;
+        }
 
-            try { _oneShotRestartWhenEmptyCts.Cancel(); }
-            catch { /* ignore */ }
-            _oneShotRestartWhenEmptyCts.Dispose();
+        if (low != null)
+        {
+            if (TryArmLiveOneShotLowActivity(low, out _, out var error))
+                ConsoleUtil.WriteLine("Re-armed carried-over one-shot restart-when-empty from a previous session.", ConsoleColor.Gray);
+            else
+                ConsoleUtil.WriteLine(
+                    $"Failed to re-arm carried-over one-shot restart-when-empty: {error} The intent is still saved; it will retry after the next restart, or run \"restartwhenempty cancel\" to clear it.",
+                    ConsoleColor.Yellow);
+        }
+
+        if (round != null)
+            ConsoleUtil.WriteLine(
+                round.RoundsRemaining <= 1
+                    ? "Armed: LocalAdmin will restart on the next round restart (carried over from a previous session)."
+                    : $"Armed: LocalAdmin will restart after {round.RoundsRemaining} more round restarts (carried over from a previous session).",
+                ConsoleColor.Gray);
+    }
+
+    private bool TryArmLiveOneShotLowActivity(OneShotLowActivityIntent intent, out RestartWhenEmptyOptions? options, out string error)
+    {
+        // Stop any prior live watchdog before starting a new one.
+        StopLiveOneShotLowActivity();
+
+        options = RestartWhenEmptyOptions.OneShot(
+            intent.RestartAtOrBelowPlayers,
+            intent.EmptyConfirmations,
+            intent.TickSeconds,
+            intent.RecentActivityOverPlayers,
+            intent.RecentActivityWindowMinutes,
+            intent.DurationSeconds);
+
+        var cts = new CancellationTokenSource();
+        var token = cts.Token; // capture before a concurrent cancel could dispose the source
+
+        try
+        {
+            var policy = new RestartWhenEmptyPolicy(this, _playerTracker, options, onRestartCommitted: OnOneShotLowActivityFired);
+            policy.Start(token);
+        }
+        catch (Exception ex)
+        {
+            cts.Dispose();
+            error = $"Failed to arm one-shot restart-when-empty: {ex.Message}.";
+            return false;
+        }
+
+        // Publish the live CTS only if this exact intent is still the pending one. If a cancel (or a
+        // replacing arm) ran while we were starting, tear the watchdog we just started back down so
+        // no orphan watchdog can restart the server after "cancel" reported success.
+        lock (OneShotIntentLock)
+        {
+            if (ReferenceEquals(_pendingOneShotLowActivity, intent))
+            {
+                _oneShotRestartWhenEmptyCts = cts;
+                error = string.Empty;
+                return true;
+            }
+        }
+
+        try { cts.Cancel(); }
+        catch { /* ignore */ }
+        cts.Dispose();
+        error = "One-shot restart-when-empty was canceled before it finished arming.";
+        return false;
+    }
+
+    // Invoked by the one-shot watchdog the moment it commits to a restart: drop the persistent
+    // intent so the relaunched session does NOT re-arm it (the one-shot has done its job).
+    private void OnOneShotLowActivityFired()
+    {
+        lock (OneShotIntentLock)
+            _pendingOneShotLowActivity = null;
+    }
+
+    private void StopLiveOneShotLowActivity()
+    {
+        CancellationTokenSource? cts;
+        lock (OneShotIntentLock)
+        {
+            cts = _oneShotRestartWhenEmptyCts;
             _oneShotRestartWhenEmptyCts = null;
-            _oneShotRestartWhenEmptyOptions = null;
+        }
+
+        if (cts == null)
+            return;
+
+        try { cts.Cancel(); }
+        catch { /* ignore */ }
+        cts.Dispose();
+    }
+
+    /// <summary>
+    /// Arms/replaces the "restart on the next round restart" one-shot. Fires after
+    /// <paramref name="rounds"/> real round restarts (server boot's initial round is skipped) and
+    /// persists across unrelated restarts until it fires or is canceled.
+    /// </summary>
+    internal bool TryArmRestartOnNextRound(int rounds, out string message)
+    {
+        if (rounds < 1)
+        {
+            message = "rounds must be 1 or higher.";
+            return false;
+        }
+
+        lock (OneShotIntentLock)
+        {
+            if (_processClosing || _exit)
+            {
+                message = "Cannot arm restart-on-next-round while LocalAdmin is shutting down.";
+                return false;
+            }
+
+            if (RestartInProgress)
+            {
+                message = "A server restart is already in progress; arm again after the server restarts.";
+                return false;
+            }
+
+            if (_pendingRoundRestart != null)
+            {
+                message = "Restart-on-next-round is already armed. Run \"restartnextround cancel\" before arming a new one.";
+                return false;
+            }
+
+            _pendingRoundRestart = new RoundRestartIntent(rounds);
+        }
+
+        message = rounds == 1
+            ? "Armed: LocalAdmin will restart on the next round restart."
+            : $"Armed: LocalAdmin will restart after {rounds} round restarts.";
+        return true;
+    }
+
+    internal bool TryCancelRestartOnNextRound(out string message)
+    {
+        lock (OneShotIntentLock)
+        {
+            if (_roundRestartFiring)
+            {
+                message = "Restart-on-next-round is firing right now; it can no longer be canceled.";
+                return false;
+            }
+
+            if (_pendingRoundRestart == null)
+            {
+                message = "Restart-on-next-round is not armed.";
+                return false;
+            }
+
+            _pendingRoundRestart = null;
+        }
+
+        message = "Restart-on-next-round canceled.";
+        return true;
+    }
+
+    internal string GetRestartOnNextRoundStatus()
+    {
+        lock (OneShotIntentLock)
+        {
+            if (_pendingRoundRestart == null)
+                return "Restart-on-next-round is not armed.";
+
+            if (_roundRestartFiring)
+                return "Restart-on-next-round is firing now.";
+
+            var remaining = _pendingRoundRestart.RoundsRemaining;
+            return remaining <= 1
+                ? "Restart-on-next-round is armed (fires on the next round restart)."
+                : $"Restart-on-next-round is armed (fires after {remaining} more round restarts).";
         }
     }
+
+    /// <summary>
+    /// Called from the TCP loop on every RoundRestart control byte. Skips the session's initial
+    /// round, then counts real round transitions toward an armed "restart on next round" one-shot.
+    /// </summary>
+    internal void NotifyRoundRestart()
+    {
+        if (!_sawInitialRoundRestart)
+        {
+            _sawInitialRoundRestart = true;
+            return;
+        }
+
+        bool fire;
+        int remaining;
+        lock (OneShotIntentLock)
+        {
+            if (_pendingRoundRestart == null || _roundRestartFiring)
+                return;
+
+            // Count this round toward the target, but do NOT clear the intent yet - we only consume
+            // it once a Restart is actually claimed below (otherwise a lost race would drop it).
+            // _roundRestartFiring blocks cancel in the meantime so it cannot report success for a
+            // restart that is already committing.
+            if (_pendingRoundRestart.RoundsRemaining <= 1)
+            {
+                fire = true;
+                remaining = 0;
+                _roundRestartFiring = true;
+            }
+            else
+            {
+                _pendingRoundRestart.RoundsRemaining--;
+                remaining = _pendingRoundRestart.RoundsRemaining;
+                fire = false;
+            }
+        }
+
+        if (!fire)
+        {
+            ConsoleUtil.WriteLine($"Round restart observed; {remaining} more until LocalAdmin restarts.", ConsoleColor.Gray);
+            return;
+        }
+
+        ConsoleUtil.WriteLine("Round restart observed; performing the scheduled LocalAdmin restart now.", ConsoleColor.Cyan);
+
+        var scheduled = false;
+        try
+        {
+            scheduled = TryScheduleGracefulRestartWithForceFallback("restart on next round restart");
+        }
+        finally
+        {
+            lock (OneShotIntentLock)
+            {
+                _roundRestartFiring = false;
+                if (scheduled)
+                    _pendingRoundRestart = null; // claimed - consume the intent (fallback will force if it stalls)
+            }
+        }
+
+        if (!scheduled)
+        {
+            // Rejected, or a non-restart shutdown/crash won: leave it armed so the next round (or a
+            // crash-restart's next session) retries instead of silently dropping the request.
+            ConsoleUtil.WriteLine("Restart-on-next-round could not be scheduled now (another shutdown action is in progress); leaving it armed.", ConsoleColor.Yellow);
+        }
+    }
+
+    // Tears down only the LIVE one-shot watchdog for a session teardown; the persistent intent is
+    // intentionally preserved so RearmPendingOneShots() can restore it in the next session.
+    private void StopOneShotWatchdogForSessionEnd() => StopLiveOneShotLowActivity();
 
     /// <summary>
     /// Performs or retries a graceful restart (the RestartCommand pattern) for an automated trigger.

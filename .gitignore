@@ -482,3 +482,6 @@ $RECYCLE.BIN/
 
 # Vim temporary swap files
 *.swp
+
+# Local fork review/test scratch area (codex review logs, publish output, captured server logs)
+.la-test/

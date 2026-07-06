@@ -34,6 +34,9 @@ jobs:
     - name: Install dependencies for ${{ matrix.target }}
       run: dotnet restore -r ${{ matrix.target }}
 
+    - name: Test
+      run: dotnet test "Tests/LocalAdmin.V2.Tests.csproj" -c release
+
     - name: Build ${{ matrix.target }}
       run: dotnet publish "LocalAdmin V2.csproj" -r ${{ matrix.target }} -c release -o "${{ github.workspace }}/builds/${{ matrix.framework }}/${{ matrix.target }}"
 

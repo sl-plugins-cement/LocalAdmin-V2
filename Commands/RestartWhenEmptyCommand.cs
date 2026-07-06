@@ -54,7 +54,8 @@ internal sealed class RestartWhenEmptyCommand : CommandBase
             Math.Max(1, config.EmptyConfirmations),
             Math.Max(1, config.PolicyTickSeconds),
             config.RecentActivityOverPlayers,
-            Math.Max(0, config.RecentActivityWindowMinutes));
+            Math.Max(0, config.RecentActivityWindowMinutes),
+            Math.Max(0, config.EmptyDurationSeconds));
 
         if (!TryApplyArguments(arguments, ref settings, out var error))
         {
@@ -69,6 +70,7 @@ internal sealed class RestartWhenEmptyCommand : CommandBase
                 settings.TickSeconds,
                 settings.RecentActivityOverPlayers,
                 settings.RecentActivityWindowMinutes,
+                settings.DurationSeconds,
                 out var message))
             ConsoleUtil.WriteLine(message, ConsoleColor.DarkGreen);
         else
@@ -156,6 +158,13 @@ internal sealed class RestartWhenEmptyCommand : CommandBase
                 settings = settings with { RecentActivityWindowMinutes = value };
                 break;
 
+            case "duration":
+            case "durationseconds":
+            case "for":
+            case "sustained":
+                settings = settings with { DurationSeconds = value };
+                break;
+
             default:
                 error = $"Unknown option \"{key}\".";
                 return false;
@@ -189,6 +198,10 @@ internal sealed class RestartWhenEmptyCommand : CommandBase
                 settings = settings with { RecentActivityWindowMinutes = value };
                 break;
 
+            case 5:
+                settings = settings with { DurationSeconds = value };
+                break;
+
             default:
                 error = "Too many positional arguments.";
                 return false;
@@ -218,10 +231,13 @@ internal sealed class RestartWhenEmptyCommand : CommandBase
     private static void PrintUsage()
     {
         ConsoleUtil.WriteLine(
-            "Usage: restartwhenempty <once|status|cancel> [threshold] [confirmations] [tickSeconds] [recentOverPlayers] [windowMinutes]",
+            "Usage: restartwhenempty <once|status|cancel> [threshold] [confirmations] [tickSeconds] [recentOverPlayers] [windowMinutes] [durationSeconds]",
             ConsoleColor.Yellow);
         ConsoleUtil.WriteLine(
-            "Named options: threshold=<players> confirmations=<count> tick=<seconds> recentOver=<players> window=<minutes>",
+            "Named options: threshold=<players> confirmations=<count> tick=<seconds> recentOver=<players> window=<minutes> duration=<seconds>",
+            ConsoleColor.Yellow);
+        ConsoleUtil.WriteLine(
+            "threshold = restart at or below this many players; duration = require the low count to hold this long. The one-shot persists across unrelated restarts until it fires or is canceled.",
             ConsoleColor.Yellow);
     }
 
@@ -230,5 +246,6 @@ internal sealed class RestartWhenEmptyCommand : CommandBase
         int EmptyConfirmations,
         int TickSeconds,
         int RecentActivityOverPlayers,
-        int RecentActivityWindowMinutes);
+        int RecentActivityWindowMinutes,
+        int DurationSeconds);
 }

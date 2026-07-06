@@ -31,6 +31,14 @@ internal sealed class CommandChannelServer
     // Per-client outbound queue bound: a slow/dead reader can fall this far behind before
     // it is dropped, so a misbehaving client can never stall the console output path.
     private const int MaxQueuedLinesPerClient = 4096;
+
+    // Bound the blast radius of a hostile/buggy client (particularly on Linux, where the pipe is
+    // reachable by the current user only but not further ACL-restricted): cap simultaneous clients,
+    // cap inbound line length (so a newline-less stream can't grow memory unbounded), and reap a
+    // connection that sends nothing for a long time.
+    private const int MaxConcurrentClients = 32;
+    private const int MaxInboundLineLength = 8 * 1024;
+    private static readonly TimeSpan IdleConnectionTimeout = TimeSpan.FromSeconds(300);
     private static readonly TimeSpan OutputCaptureWindow = TimeSpan.FromSeconds(15);
 
     private readonly string _pipeName;
@@ -221,13 +229,16 @@ internal sealed class CommandChannelServer
                 pipeSecurity: security);
         }
 
-        // Linux: no Windows ACLs; rely on the default per-user pipe location.
+        // Non-Windows: .NET maps a named pipe to a Unix-domain socket at $TMPDIR/CoreFxPipe_<name>,
+        // which is NOT per-user by default. PipeOptions.CurrentUserOnly makes the runtime restrict
+        // the socket to the current user (and rejects clients running as a different user), which is
+        // the closest equivalent to the Windows DACL. The client sets the same flag.
         return new NamedPipeServerStream(
             _pipeName,
             PipeDirection.InOut,
             maxInstances,
             PipeTransmissionMode.Byte,
-            PipeOptions.Asynchronous);
+            PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
     }
 
     private static PipeSecurity BuildPipeSecurity()
@@ -257,6 +268,7 @@ internal sealed class CommandChannelServer
     private void RegisterClient(NamedPipeServerStream server, CancellationToken token)
     {
         var client = new ClientConnection(server, MaxQueuedLinesPerClient);
+        var rejected = false;
 
         lock (_clientsLock)
         {
@@ -266,10 +278,27 @@ internal sealed class CommandChannelServer
                 return;
             }
 
-            _clients.Add(client);
+            if (_clients.Count >= MaxConcurrentClients)
+            {
+                rejected = true;
+            }
+            else
+            {
+                _clients.Add(client);
+
+                // Start under the lock so a concurrent Stop() (which snapshots+disposes _clients
+                // under the same lock) cannot dispose this client's CTS before Start() reads it.
+                client.Start(token, OnClientLine, RemoveClient);
+            }
         }
 
-        client.Start(token, OnClientLine, RemoveClient);
+        if (rejected)
+        {
+            client.Dispose();
+            ConsoleUtil.WriteLine(
+                $"Command channel: rejecting connection, already at the {MaxConcurrentClients}-client limit.",
+                ConsoleColor.Yellow);
+        }
     }
 
     private void OnClientLine(ClientConnection client, string line)
@@ -337,7 +366,9 @@ internal sealed class CommandChannelServer
             }
             catch (InvalidOperationException)
             {
-                return true; // adding completed concurrently
+                // Adding completed / collection disposed concurrently. Note ObjectDisposedException
+                // derives from InvalidOperationException, so a concurrent Dispose() is covered here.
+                return true;
             }
         }
 
@@ -346,18 +377,62 @@ internal sealed class CommandChannelServer
             var linked = CancellationTokenSource.CreateLinkedTokenSource(parentToken, _cts.Token);
             var token = linked.Token;
 
-            // Reader pump: client -> LocalAdmin input queue.
+            // Reader pump: client -> LocalAdmin input queue. Reads in bounded chunks (never
+            // ReadLineAsync, which would buffer a newline-less stream without limit) and enforces a
+            // per-line cap and an idle timeout.
             var readerTask = Task.Run(async () =>
             {
                 try
                 {
                     using var reader = new StreamReader(_stream, new UTF8Encoding(false), false, 1024, leaveOpen: true);
+                    var lineBuffer = new StringBuilder();
+                    var chunk = new char[1024];
+
                     while (!token.IsCancellationRequested && _stream.IsConnected)
                     {
-                        var line = await reader.ReadLineAsync().ConfigureAwait(false);
-                        if (line == null)
+                        var read = 0;
+                        using (var idleCts = CancellationTokenSource.CreateLinkedTokenSource(token))
+                        {
+                            idleCts.CancelAfter(IdleConnectionTimeout);
+                            try
+                            {
+                                read = await reader.ReadAsync(chunk.AsMemory(), idleCts.Token).ConfigureAwait(false);
+                            }
+                            catch (OperationCanceledException) when (idleCts.IsCancellationRequested && !token.IsCancellationRequested)
+                            {
+                                break; // idle timeout - reap the connection
+                            }
+                        }
+
+                        if (read == 0)
                             break; // client closed its write side
-                        onLine(this, line);
+
+                        var aborted = false;
+                        for (var i = 0; i < read; i++)
+                        {
+                            var c = chunk[i];
+                            if (c == '\n')
+                            {
+                                var line = lineBuffer.ToString().TrimEnd('\r');
+                                lineBuffer.Clear();
+                                onLine(this, line);
+                            }
+                            else if (lineBuffer.Length >= MaxInboundLineLength)
+                            {
+                                ConsoleUtil.WriteLine(
+                                    "Command channel: inbound line exceeded the maximum length; dropping client.",
+                                    ConsoleColor.Yellow);
+                                aborted = true;
+                                break;
+                            }
+                            else
+                            {
+                                lineBuffer.Append(c);
+                            }
+                        }
+
+                        if (aborted)
+                            break;
                     }
                 }
                 catch (OperationCanceledException) { }

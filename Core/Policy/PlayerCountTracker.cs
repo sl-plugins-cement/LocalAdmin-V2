@@ -10,61 +10,79 @@ using System.Text.RegularExpressions;
 namespace LocalAdmin.V2.Core.Policy;
 
 /// <summary>
-/// Tracks the live player count by parsing the SCP:SL console output that LocalAdmin
-/// already receives, plus the authoritative Idle enter/exit control bytes from the
-/// game's TCP channel. All mutations are guarded by a single lock so the policy
-/// watchdog, the console-line handler and the TCP receive loop can all touch it safely.
+/// Tracks the live player count for the restart-when-empty watchdog.
+///
+/// The <b>authoritative</b> source is the server's own <c>List of players (N):</c> console line
+/// (emitted in response to the <c>players</c> command, which the watchdog polls) and the game's
+/// IdleEnter control byte (an authoritative "0 players" signal). These are timestamped, so the
+/// policy can require a <i>fresh</i> reading before it acts - it never restarts on a stale count.
+/// A list reply is only accepted when a <c>players</c> poll was recently issued (see
+/// <see cref="NotePlayersPollIssued()"/>) and the line matches the reply shape exactly, so
+/// player-controlled text (e.g. a nickname crafted to look like a list header) can never spoof
+/// the count.
+///
+/// The <c>authenticated ... Player ID assigned</c> / <c>disconnected from IP address</c> console
+/// regexes are kept only as a <b>best-effort supplementary</b> signal for the live status display
+/// before the first authoritative reading; they are intentionally NOT used to make restart
+/// decisions, because their exact wording is version- and plugin-dependent and a disconnect line
+/// does not reliably carry the numeric player id. All mutations are guarded by a single lock so
+/// the policy watchdog, the console-line handler and the TCP receive loop can touch it safely.
 /// </summary>
 internal sealed class PlayerCountTracker
 {
-    // "<color>...authenticated from endpoint 1.2.3.4:5678. ... Player ID assigned: 7."
+    // Authoritative: the server's reply to the "players" command, e.g. "List of players (0):"
+    // (player entries follow on separate lines). End-anchored: console lines can embed
+    // player-controlled text (a nickname leads the authentication line), so a line that merely
+    // STARTS with this shape (e.g. a player named "List of players (0):" joining) must not match.
+    private static readonly Regex PlayersListRegex = new(
+        @"^\s*List of players \((\d+)\):?\s*$",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    // Best-effort supplementary only (see class summary) - not used for restart decisions.
     private static readonly Regex JoinRegex = new(
         @"authenticated from endpoint .+ Player ID assigned: (\d+)\.",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
-    // "<color>... 7 disconnected from IP address 1.2.3.4. Last class: ..."
-    // The captured id (when present) lets us keep the join set in sync.
     private static readonly Regex LeaveRegex = new(
         @"(?:Player\s+)?(\d+)?\s*disconnected from IP address .+ Last class:",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
+    // After the server is known to have left the empty state (an IdleExit byte OR a parsed join),
+    // briefly reject ANY players reply: it may be the in-flight answer to a poll sent while the
+    // server was still empty, and accepting a stale low count as fresh (not just 0 - anything at
+    // or below a restart threshold) would drive a mid-round false restart. Bounded so it never
+    // suppresses a genuine empty, and the watchdog re-polls every tick so a genuine reading lands
+    // right after the window.
+    private static readonly TimeSpan StaleReplySuppressWindow = TimeSpan.FromSeconds(5);
+
+    // A players-list reply is only trusted if WE recently asked for one (the watchdog's poll or a
+    // user-typed "players" command). Belt-and-suspenders on top of the end-anchored regex: an
+    // unsolicited line that happens to look like a list reply is never an authoritative count.
+    private static readonly TimeSpan PollReplyAcceptWindow = TimeSpan.FromSeconds(10);
+
     private readonly object _lock = new();
 
-    // Authoritative set of player ids currently authenticated (per console parsing).
+    // Best-effort set of player ids seen via console parsing (supplementary display only).
     private readonly HashSet<int> _players = new();
 
-    // The game raised IdleEnter (no players) - treated as an authoritative "empty" signal
-    // that overrides any drift in the parsed set.
-    private bool _idleEmpty;
+    // Authoritative count + when it was observed. Null => currently unknown (must be (re)polled).
+    private int? _authoritativeCount;
+    private DateTime _authoritativeAtUtc;
 
-    // Becomes true once we have observed an authoritative readiness signal for THIS session
-    // (the game's IdleEnter/IdleExit control byte, or a real player join). Until then the
-    // player count is "unknown" and the restart-when-empty policy must not act on it - this
-    // prevents restarting an empty count reported merely because the game is still booting.
+    // Set when the server is known to have become non-empty (IdleExit or a parsed join); gates the
+    // brief stale-reply suppression above.
+    private DateTime? _leftEmptyAtUtc;
+
+    // When a "players" poll was last sent to the game; gates list-reply acceptance above.
+    private DateTime? _lastPollIssuedAtUtc;
+
+    // Becomes true once we have observed ANY authoritative signal for THIS session (a players-list
+    // reply, an idle byte, or a real join). Until then the count is "unknown" and the policy must
+    // not act - this prevents restarting merely because the game is still booting.
     private bool _ready;
 
-    // True when CurrentCount is meaningful for policy decisions. IdleExit proves the server
-    // is non-idle, but if the matching join line is not parsed we know only "nonzero", not
-    // the actual count, so restart-when-empty must not treat the parsed set size as empty.
-    private bool _countKnown;
-
     /// <summary>
-    /// Best-effort current player count. When the game reports IDLE (IdleEnter without a
-    /// subsequent IdleExit) we trust that as 0 regardless of any parsing drift.
-    /// </summary>
-    internal int CurrentCount
-    {
-        get
-        {
-            lock (_lock)
-                return _idleEmpty ? 0 : _players.Count;
-        }
-    }
-
-    /// <summary>
-    /// True once an authoritative signal (idle byte or a real join) has established that the
-    /// server is up for this session. The restart-when-empty policy also requires
-    /// <see cref="TryGetKnownCount"/> before it can act on the count.
+    /// True once an authoritative signal has established that the server is up for this session.
     /// </summary>
     internal bool IsReady
     {
@@ -76,96 +94,178 @@ internal sealed class PlayerCountTracker
     }
 
     /// <summary>
-    /// Attempts to read a count that is safe for restart-when-empty decisions.
+    /// Best-effort current player count for status display: the last authoritative reading if we
+    /// have one, otherwise the size of the parsed set. Not safe for restart decisions - use
+    /// <see cref="TryGetFreshCount"/> for those.
+    /// </summary>
+    internal int CurrentCount
+    {
+        get
+        {
+            lock (_lock)
+                return _authoritativeCount ?? _players.Count;
+        }
+    }
+
+    /// <summary>
+    /// Returns the last authoritative count regardless of age (for status display).
     /// </summary>
     internal bool TryGetKnownCount(out int count)
     {
         lock (_lock)
         {
-            if (!_ready || !_countKnown)
+            if (_authoritativeCount.HasValue)
             {
-                count = 0;
-                return false;
+                count = _authoritativeCount.Value;
+                return true;
             }
 
-            count = _idleEmpty ? 0 : _players.Count;
-            return true;
+            count = 0;
+            return false;
         }
     }
 
     /// <summary>
-    /// Feeds a single console line (already stripped of its color prefix). Returns true if
-    /// the count changed as a result.
+    /// Returns the authoritative count only if it was observed within <paramref name="maxAge"/> of
+    /// <paramref name="nowUtc"/>. This is the ONLY count the restart-when-empty policy acts on, so a
+    /// stale reading can never drive a restart.
     /// </summary>
-    internal bool ProcessConsoleLine(string line)
+    internal bool TryGetFreshCount(DateTime nowUtc, TimeSpan maxAge, out int count)
+    {
+        lock (_lock)
+        {
+            if (_authoritativeCount.HasValue && nowUtc - _authoritativeAtUtc <= maxAge)
+            {
+                count = _authoritativeCount.Value;
+                return true;
+            }
+
+            count = 0;
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Records that a <c>players</c> command was just sent to the game. List replies are only
+    /// accepted within <see cref="PollReplyAcceptWindow"/> of a noted poll, so console lines that
+    /// merely look like a list reply (player-controlled text) can never set the count.
+    /// </summary>
+    internal void NotePlayersPollIssued() => NotePlayersPollIssued(DateTime.UtcNow);
+
+    internal void NotePlayersPollIssued(DateTime nowUtc)
+    {
+        lock (_lock)
+            _lastPollIssuedAtUtc = nowUtc;
+    }
+
+    /// <summary>
+    /// Feeds a single console line (already stripped of its color prefix). Returns true if the
+    /// authoritative count changed as a result.
+    /// </summary>
+    internal bool ProcessConsoleLine(string line) => ProcessConsoleLine(line, DateTime.UtcNow);
+
+    internal bool ProcessConsoleLine(string line, DateTime nowUtc)
     {
         if (string.IsNullOrEmpty(line))
             return false;
 
+        // Authoritative: the "players" command reply.
+        var listMatch = PlayersListRegex.Match(line);
+        if (listMatch.Success &&
+            int.TryParse(listMatch.Groups[1].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var listCount))
+        {
+            lock (_lock)
+            {
+                // Only trust a reply we actually solicited (see PollReplyAcceptWindow above). An
+                // unsolicited list-shaped line must not mark the session ready or set a count.
+                if (!_lastPollIssuedAtUtc.HasValue ||
+                    nowUtc - _lastPollIssuedAtUtc.Value > PollReplyAcceptWindow)
+                    return false;
+
+                _ready = true;
+
+                // Reject any reply that lands within the suppression window after the server was
+                // known to leave empty - it may be the stale answer to a poll issued before a join.
+                if (_leftEmptyAtUtc.HasValue &&
+                    nowUtc - _leftEmptyAtUtc.Value < StaleReplySuppressWindow)
+                    return false;
+
+                var changed = _authoritativeCount != listCount;
+                _authoritativeCount = listCount;
+                _authoritativeAtUtc = nowUtc;
+                _leftEmptyAtUtc = null; // an accepted reading resolves the ambiguity
+
+                // Keep the supplementary set from drifting unboundedly once we have ground truth.
+                if (listCount == 0)
+                    _players.Clear();
+
+                return changed;
+            }
+        }
+
+        // A real join proves the server is up and non-empty. Beyond the supplementary set, this
+        // INVALIDATES any (possibly stale, low) authoritative reading and opens the zero-reply
+        // suppression window, so a fresh "List of players (0)" cannot drive a restart the moment a
+        // player joins - the policy will re-poll for the true count. This is the only empty->nonempty
+        // signal when the game's idle mode is disabled (no IdleExit byte).
         var joinMatch = JoinRegex.Match(line);
         if (joinMatch.Success &&
             int.TryParse(joinMatch.Groups[1].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var joinId))
         {
             lock (_lock)
             {
-                // A real authentication means the server is up and no longer idle/empty.
                 _ready = true;
-                _countKnown = true;
-                var changed = _players.Add(joinId);
-                if (_idleEmpty)
-                {
-                    _idleEmpty = false;
-                    changed = true;
-                }
-
-                return changed;
+                _players.Add(joinId);
+                _authoritativeCount = null;
+                _leftEmptyAtUtc = nowUtc;
+                return false;
             }
         }
 
         var leaveMatch = LeaveRegex.Match(line);
-        if (leaveMatch.Success)
+        if (leaveMatch.Success &&
+            leaveMatch.Groups[1].Success &&
+            int.TryParse(leaveMatch.Groups[1].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var leaveId))
         {
             lock (_lock)
-            {
-                if (leaveMatch.Groups[1].Success &&
-                    int.TryParse(leaveMatch.Groups[1].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var leaveId))
-                    return _players.Remove(leaveId);
-
-                // No id captured: we can't reliably know who left. Don't guess (avoids
-                // under-counting). The IdleEnter byte remains the authoritative empty signal.
-                return false;
-            }
+                _players.Remove(leaveId);
         }
 
         return false;
     }
 
     /// <summary>
-    /// Authoritative empty signal from the game's IdleEnter control byte. The game only emits
-    /// this once it is up and idle, so it also marks the session as ready.
+    /// Authoritative empty signal from the game's IdleEnter control byte (the game only emits this
+    /// once it is up and idle), so it also marks the session ready and the count as a fresh 0.
     /// </summary>
-    internal void NotifyIdleEnter()
+    internal void NotifyIdleEnter() => NotifyIdleEnter(DateTime.UtcNow);
+
+    internal void NotifyIdleEnter(DateTime nowUtc)
     {
         lock (_lock)
         {
             _ready = true;
-            _countKnown = true;
-            _idleEmpty = true;
+            _authoritativeCount = 0;
+            _authoritativeAtUtc = nowUtc;
+            _leftEmptyAtUtc = null; // authoritative empty - no ambiguity to suppress
             _players.Clear();
         }
     }
 
     /// <summary>
-    /// The game left idle mode (a player connected) - clear the empty override and mark ready.
-    /// If no player id has been parsed yet, the count is nonzero but unknown.
+    /// The game left idle mode (a player connected). The count is now non-zero but unknown, so we
+    /// INVALIDATE the authoritative reading (forcing a fresh <c>players</c> poll) - this prevents a
+    /// stale "0" from the previous IdleEnter driving a mid-round restart.
     /// </summary>
-    internal void NotifyIdleExit()
+    internal void NotifyIdleExit() => NotifyIdleExit(DateTime.UtcNow);
+
+    internal void NotifyIdleExit(DateTime nowUtc)
     {
         lock (_lock)
         {
             _ready = true;
-            _idleEmpty = false;
-            _countKnown = _players.Count > 0;
+            _authoritativeCount = null;
+            _leftEmptyAtUtc = nowUtc;
         }
     }
 
@@ -175,9 +275,11 @@ internal sealed class PlayerCountTracker
         lock (_lock)
         {
             _players.Clear();
-            _idleEmpty = false;
+            _authoritativeCount = null;
+            _authoritativeAtUtc = default;
+            _leftEmptyAtUtc = null;
+            _lastPollIssuedAtUtc = null;
             _ready = false;
-            _countKnown = false;
         }
     }
 }

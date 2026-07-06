@@ -59,11 +59,20 @@ else {
     $pipeName = "$BaseName-$Port"
 }
 
+# CurrentUserOnly matches the server: on non-Windows it restricts the socket to this user, and on
+# Windows it verifies the pipe server runs as the same user (defense against a squatted pipe). It
+# was added in .NET Framework 4.7.2 / .NET Core 2.1, so gate on it for older Windows PowerShell 5.1
+# hosts (which would otherwise fail resolving the enum member).
+$pipeOptions = [System.IO.Pipes.PipeOptions]::Asynchronous
+if ([enum]::IsDefined([System.IO.Pipes.PipeOptions], 'CurrentUserOnly')) {
+    $pipeOptions = $pipeOptions -bor ([System.IO.Pipes.PipeOptions]::CurrentUserOnly)
+}
+
 $pipe = New-Object System.IO.Pipes.NamedPipeClientStream(
     $Server,
     $pipeName,
     [System.IO.Pipes.PipeDirection]::InOut,
-    [System.IO.Pipes.PipeOptions]::Asynchronous)
+    $pipeOptions)
 
 try {
     try {
@@ -86,9 +95,17 @@ try {
     # Read reply frames until the channel goes quiet or the hard timeout elapses.
     # IMPORTANT: only one ReadLineAsync may be in flight on a stream at a time, so we hold a
     # single pending task across poll iterations and only start a new read once it completes.
+    #
+    # LocalAdmin echoes every processed input line as ">>> <command>". We ANCHOR on our own echo:
+    # lines before it (background console output, or another concurrent client's reply) are
+    # discarded, and only the output after our echo is treated as our command's reply. If the echo
+    # is never seen (older server), we fall back to emitting everything we captured.
+    $echoMarker = ">>> " + $Command.Trim()
     $overall = [System.Diagnostics.Stopwatch]::StartNew()
-    $lastLine = [System.Diagnostics.Stopwatch]::StartNew()
-    $gotAny = $false
+    $lastActivity = [System.Diagnostics.Stopwatch]::StartNew()
+    $anchored = $false
+    $gotReply = $false
+    $preAnchor = New-Object System.Collections.Generic.List[string]
     $slice = [Math]::Min(150, [Math]::Max(50, $QuietMs))
     $readTask = $reader.ReadLineAsync()
 
@@ -98,19 +115,44 @@ try {
             if ($null -eq $line) {
                 break  # pipe closed by server
             }
-            Write-Output $line
-            $gotAny = $true
-            $lastLine.Restart()
+            $lastActivity.Restart()
+            if (-not $anchored) {
+                if ($line.Trim() -eq $echoMarker) {
+                    $anchored = $true  # our command's echo; the reply follows
+                }
+                else {
+                    $preAnchor.Add($line)
+                }
+            }
+            else {
+                Write-Output $line
+                $gotReply = $true
+            }
             $readTask = $reader.ReadLineAsync()  # start the next read only after this one finished
         }
-        elseif ($gotAny -and $lastLine.ElapsedMilliseconds -ge $QuietMs) {
-            break  # reply has settled (a read is still pending; we just abandon it on dispose)
+        elseif ($anchored -and $lastActivity.ElapsedMilliseconds -ge $QuietMs) {
+            break  # our reply has settled (a read is still pending; we just abandon it on dispose)
         }
     }
 
-    if (-not $gotAny) {
+    if (-not $anchored) {
+        # Never saw our echo: fall back to emitting whatever the channel sent.
+        foreach ($bufferedLine in $preAnchor) {
+            Write-Output $bufferedLine
+            $gotReply = $true
+        }
+    }
+
+    if (-not $gotReply -and -not $anchored) {
         Write-Error "Connected to '$pipeName' but received no output within timeout. (Command may have produced no reply, or the channel is busy.)"
         exit 3
+    }
+
+    if (-not $gotReply -and $anchored) {
+        # The command was delivered (we saw its echo) but nothing followed within the quiet
+        # window - most likely it simply produces no console reply. Say so instead of silently
+        # printing nothing; still exit 0 because delivery succeeded.
+        Write-Warning "Command was delivered (echo seen) but produced no output within ${QuietMs}ms."
     }
 }
 finally {

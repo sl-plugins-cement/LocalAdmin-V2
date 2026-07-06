@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
+using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
 namespace LocalAdmin.V2.IO;
@@ -24,6 +25,53 @@ internal static class ServerApplicationLocator
 {
     private const string DedicatedServerSteamAppId = "996560";
     private const string DedicatedServerSteamFolder = "SCP Secret Laboratory Dedicated Server";
+
+    // Unix-style $VAR and ${VAR} references, expanded on non-Windows only.
+    private static readonly Regex UnixEnvVarRegex = new(
+        @"\$\{([^}]+)\}|\$([A-Za-z_][A-Za-z0-9_]*)",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    /// <summary>
+    /// Expands environment variables in a configured path cross-platform: Windows <c>%VAR%</c> on
+    /// all platforms, plus Unix <c>$VAR</c>/<c>${VAR}</c> and a leading <c>~</c> on non-Windows, so a
+    /// Linux path like <c>$HOME/scpsl/SCPSL.x86_64</c> resolves instead of being treated as literal.
+    /// </summary>
+    internal static string ExpandPath(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return string.Empty;
+
+        var value = Environment.ExpandEnvironmentVariables(path.Trim().Trim('"'));
+
+        if (!OperatingSystem.IsWindows())
+        {
+            var home = GetHomeDirectory();
+            if (!string.IsNullOrEmpty(home))
+            {
+                if (value == "~")
+                    value = home;
+                else if (value.StartsWith("~/", StringComparison.Ordinal))
+                    value = home + value[1..];
+            }
+
+            value = UnixEnvVarRegex.Replace(value, match =>
+            {
+                var name = match.Groups[1].Success ? match.Groups[1].Value : match.Groups[2].Value;
+                var expanded = Environment.GetEnvironmentVariable(name);
+                return expanded ?? match.Value; // leave unknown variables literal
+            });
+        }
+
+        return value;
+    }
+
+    private static string GetHomeDirectory()
+    {
+        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        return string.IsNullOrWhiteSpace(home)
+            ? Environment.GetEnvironmentVariable("HOME") ?? string.Empty
+            : home;
+    }
 
     internal static bool TryLocate(
         string executableName,
@@ -74,7 +122,7 @@ internal static class ServerApplicationLocator
         if (string.IsNullOrWhiteSpace(configuredPath))
             return false;
 
-        var expanded = Environment.ExpandEnvironmentVariables(configuredPath.Trim().Trim('"'));
+        var expanded = ExpandPath(configuredPath);
         return !string.IsNullOrWhiteSpace(expanded);
     }
 
@@ -88,7 +136,7 @@ internal static class ServerApplicationLocator
         if (string.IsNullOrWhiteSpace(configuredPath))
             return;
 
-        var configDirectory = string.IsNullOrWhiteSpace(configFilePath) ? null : Path.GetDirectoryName(configFilePath);
+        var configDirectory = GetConfigDirectory(configFilePath);
 
         foreach (var resolved in ResolveConfiguredPaths(configuredPath, configDirectory))
         {
@@ -102,7 +150,7 @@ internal static class ServerApplicationLocator
 
     private static IEnumerable<string> ResolveConfiguredPaths(string configuredPath, string? configDirectory)
     {
-        var expanded = Environment.ExpandEnvironmentVariables(configuredPath.Trim().Trim('"'));
+        var expanded = ExpandPath(configuredPath);
         if (string.IsNullOrWhiteSpace(expanded))
             yield break;
 
@@ -112,10 +160,45 @@ internal static class ServerApplicationLocator
             yield break;
         }
 
-        if (!string.IsNullOrWhiteSpace(configDirectory))
-            yield return Path.GetFullPath(expanded, configDirectory);
+        if (!string.IsNullOrWhiteSpace(configDirectory) &&
+            TryGetFullPath(expanded, configDirectory, out var configRelativePath))
+        {
+            yield return configRelativePath;
+        }
 
-        yield return Path.GetFullPath(expanded, Environment.CurrentDirectory);
+        if (TryGetFullPath(expanded, Environment.CurrentDirectory, out var currentDirectoryRelativePath))
+            yield return currentDirectoryRelativePath;
+    }
+
+    private static string? GetConfigDirectory(string? configFilePath)
+    {
+        if (string.IsNullOrWhiteSpace(configFilePath))
+            return null;
+
+        try
+        {
+            var expanded = ExpandPath(configFilePath);
+            var directory = Path.GetDirectoryName(expanded);
+            return string.IsNullOrWhiteSpace(directory) ? null : Path.GetFullPath(directory);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static bool TryGetFullPath(string path, string basePath, out string fullPath)
+    {
+        try
+        {
+            fullPath = Path.GetFullPath(path, basePath);
+            return true;
+        }
+        catch
+        {
+            fullPath = string.Empty;
+            return false;
+        }
     }
 
     private static bool LooksLikeExecutablePath(string path, string executableName)
@@ -230,10 +313,42 @@ internal static class ServerApplicationLocator
         foreach (var line in lines)
         {
             var fields = ReadVdfQuotedFields(line);
-            if (fields.Count >= 2 && fields[0].Equals("path", StringComparison.OrdinalIgnoreCase))
+            if (fields.Count < 2)
+                continue;
+
+            // Modern format: each library block has a "path" key.
+            if (fields[0].Equals("path", StringComparison.OrdinalIgnoreCase))
+            {
+                yield return fields[1];
+                continue;
+            }
+
+            // Legacy (pre-2021) flat format: the library dir is the VALUE of a numeric key, e.g.
+            // "1"  "D:\\SteamLibrary". Only accept it when the value actually looks like a path, so
+            // the modern "apps" block ("<appid>" "<sizeBytes>") is not mistaken for a library root.
+            if (IsAllDigits(fields[0]) && LooksLikePath(fields[1]))
                 yield return fields[1];
         }
     }
+
+    private static bool IsAllDigits(string value)
+    {
+        if (value.Length == 0)
+            return false;
+
+        foreach (var c in value)
+        {
+            if (c is < '0' or > '9')
+                return false;
+        }
+
+        return true;
+    }
+
+    private static bool LooksLikePath(string value) =>
+        value.Contains('/', StringComparison.Ordinal) ||
+        value.Contains('\\', StringComparison.Ordinal) ||
+        Path.IsPathRooted(value);
 
     private static string? TryReadSteamInstallDir(string libraryRoot)
     {
@@ -263,7 +378,7 @@ internal static class ServerApplicationLocator
         if (string.IsNullOrWhiteSpace(directory))
             return;
 
-        var fullPath = ToFullPath(Environment.ExpandEnvironmentVariables(directory.Trim().Trim('"')));
+        var fullPath = ToFullPath(ExpandPath(directory));
         if (seenRoots.Add(NormalizeKey(fullPath)))
             roots.Add(fullPath);
     }
@@ -277,7 +392,7 @@ internal static class ServerApplicationLocator
         if (string.IsNullOrWhiteSpace(executablePath))
             return;
 
-        var fullPath = ToFullPath(Environment.ExpandEnvironmentVariables(executablePath.Trim().Trim('"')));
+        var fullPath = ToFullPath(ExpandPath(executablePath));
         if (seen.Add(NormalizeKey(fullPath)))
             candidates.Add(new ServerApplicationCandidate(source, fullPath));
     }

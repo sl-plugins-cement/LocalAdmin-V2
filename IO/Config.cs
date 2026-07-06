@@ -5,8 +5,6 @@ namespace LocalAdmin.V2.IO;
 
 public class Config
 {
-    private static readonly string[] SplitArray = { ": " };
-
     public bool RestartOnCrash = true;
     public bool EnableHeartbeat = true;
     public bool SetTerminalTitle = true;
@@ -37,6 +35,7 @@ public class Config
     public bool AutoRestartEmptyEnabled;
     public int RestartAtOrBelowPlayers = 1;
     public int EmptyConfirmations = 2;
+    public int EmptyDurationSeconds;
     public int PolicyTickSeconds = 30;
     public int RecentActivityOverPlayers = 5;
     public int RecentActivityWindowMinutes = 30;
@@ -136,6 +135,9 @@ public class Config
         sb.Append("empty_confirmations: ");
         sb.AppendLine(EmptyConfirmations.ToString());
 
+        sb.Append("empty_duration_seconds: ");
+        sb.AppendLine(EmptyDurationSeconds.ToString());
+
         sb.Append("policy_tick_seconds: ");
         sb.AppendLine(PolicyTickSeconds.ToString());
 
@@ -154,12 +156,13 @@ public class Config
 
         foreach (var line in lines)
         {
-            if (!line.Contains(": ", StringComparison.Ordinal))
+            // Split on the FIRST ": " only, so values that themselves contain ": " (e.g. a POSIX
+            // path like "/home/user/my: server/SCPSL.x86_64") are preserved instead of dropped.
+            var separatorIndex = line.IndexOf(": ", StringComparison.Ordinal);
+            if (separatorIndex < 0)
                 continue;
 
-            var sp = line.Split(SplitArray, StringSplitOptions.None);
-            if (sp.Length != 2)
-                continue;
+            var sp = new[] { line[..separatorIndex], line[(separatorIndex + 2)..] };
 
             switch (sp[0].ToLowerInvariant())
             {
@@ -288,6 +291,12 @@ public class Config
                     cfg.EmptyConfirmations = b;
                     break;
 
+                case "empty_duration_seconds" when int.TryParse(sp[1], out var b):
+                    if (b < 0)
+                        b = 0;
+                    cfg.EmptyDurationSeconds = b;
+                    break;
+
                 case "policy_tick_seconds" when int.TryParse(sp[1], out var b):
                     if (b < 1)
                         b = 1;
@@ -383,7 +392,14 @@ public class Config
             sb.Append(RestartAtOrBelowPlayers);
             sb.Append(" players after ");
             sb.Append(EmptyConfirmations);
-            sb.Append(" confirmations, polling every ");
+            sb.Append(" confirmations");
+            if (EmptyDurationSeconds > 0)
+            {
+                sb.Append(" and ");
+                sb.Append(EmptyDurationSeconds);
+                sb.Append("s sustained");
+            }
+            sb.Append(", polling every ");
             sb.Append(PolicyTickSeconds);
             sb.Append("s, blocked if the last ");
             sb.Append(RecentActivityWindowMinutes);

@@ -126,6 +126,13 @@ public class TcpServer
                         }
                         else
                         {
+                            // Ignore control bytes once this TcpServer is no longer the active
+                            // session's server (an in-process restart created a new session/server).
+                            // Otherwise a late byte from the old connection could seed the new
+                            // session's player tracker or round-restart counter.
+                            if (!ReferenceEquals(LocalAdmin.Singleton?.Server, this))
+                                continue;
+
                             if (LocalAdmin.PrintControlMessages)
                                 Received?.Invoke(this, "7[LocalAdmin] Received control message: " + codeBuffer[0]);
 
@@ -135,6 +142,7 @@ public class TcpServer
                                     if (restartReceived)
                                         Logger.Initialize();
                                     else restartReceived = true;
+                                    LocalAdmin.Singleton?.NotifyRoundRestart();
                                     break;
 
                                 case OutputCodes.IdleEnter:

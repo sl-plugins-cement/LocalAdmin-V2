@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+    <PropertyGroup>
+        <!-- Mirror the app project's RID-conditional TFM so a win-x64 restore/build (CI passes
+             `-r win-x64`) resolves this project AND its app ProjectReference to the same framework,
+             instead of a net10.0 test project trying to reference a net8.0-windows app. -->
+        <TargetFramework Condition="$(RuntimeIdentifier.StartsWith('win', StringComparison.OrdinalIgnoreCase))">net8.0-windows</TargetFramework>
+        <TargetFramework Condition="!$(RuntimeIdentifier.StartsWith('win', StringComparison.OrdinalIgnoreCase))">net10.0</TargetFramework>
+        <LangVersion>14</LangVersion>
+        <Nullable>enable</Nullable>
+        <IsPackable>false</IsPackable>
+        <IsPublishable>false</IsPublishable>
+        <OutputType>Library</OutputType>
+        <AssemblyName>LocalAdmin.V2.Tests</AssemblyName>
+        <RootNamespace>LocalAdmin.V2.Tests</RootNamespace>
+        <!-- The main project is an AOT-published Exe; none of that applies to the test project. -->
+        <PublishAot>false</PublishAot>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+        <PackageReference Include="xunit" Version="2.9.2" />
+        <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\LocalAdmin V2.csproj" />
+    </ItemGroup>
+</Project>
