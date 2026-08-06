@@ -45,10 +45,6 @@
         <PlatformTarget>x64</PlatformTarget>
         <DebugType>none</DebugType>
     </PropertyGroup>
-    <ItemGroup Condition="$(RuntimeIdentifier.StartsWith('linux', StringComparison.OrdinalIgnoreCase))">
-        <PackageReference Include="Mono.Posix.NETStandard" Version="1.0.0" />
-    </ItemGroup>
-
     <PropertyGroup>
         <PublishAot>true</PublishAot>
     </PropertyGroup>

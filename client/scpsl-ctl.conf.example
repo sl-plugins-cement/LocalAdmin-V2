@@ -1,0 +1,12 @@
+# Optional /etc/default/scpsl-ctl configuration for client/scpsl-ctl.
+# Keep the installed file root-owned because the wrapper sources it before using sudo.
+
+LOCALADMIN_BIN=/opt/scpsl-localadmin/current/LocalAdmin
+LOCALADMIN_USER=scpsl
+LOCALADMIN_PORT=7777
+LOCALADMIN_PIPE_BASE=LocalAdmin-Console
+
+# Serialize replies because the underlying compatibility protocol broadcasts console lines to
+# every active capture window. The lock is created/acquired as LOCALADMIN_USER by the wrapper.
+LOCALADMIN_LOCK_FILE=/tmp/scpsl-localadmin-7777.ctl.lock
+LOCALADMIN_LOCK_TIMEOUT_SECONDS=20

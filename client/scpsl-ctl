@@ -1,0 +1,56 @@
+#!/bin/sh
+# Generic SSH-side wrapper for LocalAdmin's native command-channel client.
+# Install as (for example) /usr/local/bin/scpsl-ctl and keep the optional config root-owned.
+set -eu
+
+# This fixed file must be root-owned. Do not accept an environment-selected config path: a
+# caller that is allowed to use this wrapper must not be able to make sudo execute an arbitrary
+# binary as the LocalAdmin service account.
+config_file=/etc/default/scpsl-ctl
+LOCALADMIN_BIN=/opt/scpsl-localadmin/current/LocalAdmin
+LOCALADMIN_USER=scpsl
+LOCALADMIN_PORT=7777
+LOCALADMIN_PIPE_BASE=LocalAdmin-Console
+LOCALADMIN_LOCK_FILE=
+LOCALADMIN_LOCK_TIMEOUT_SECONDS=20
+
+if [ -r "$config_file" ]; then
+    # shellcheck source=/dev/null
+    . "$config_file"
+fi
+
+localadmin_bin=$LOCALADMIN_BIN
+localadmin_user=$LOCALADMIN_USER
+localadmin_port=$LOCALADMIN_PORT
+localadmin_pipe_base=$LOCALADMIN_PIPE_BASE
+localadmin_lock_file=${LOCALADMIN_LOCK_FILE:-/tmp/scpsl-localadmin-${localadmin_port}.ctl.lock}
+localadmin_lock_timeout=$LOCALADMIN_LOCK_TIMEOUT_SECONDS
+
+if [ ! -x "$localadmin_bin" ]; then
+    echo "scpsl-ctl: LocalAdmin executable is not available at $localadmin_bin" >&2
+    echo "Set LOCALADMIN_BIN or configure it in $config_file." >&2
+    exit 127
+fi
+
+run_client() {
+    # Exit 75 distinguishes lock contention from LocalAdmin's own client exit codes. Run flock
+    # as the service user so that account owns/opens the lock as well as the CurrentUserOnly pipe.
+    exec flock -E 75 -w "$localadmin_lock_timeout" "$localadmin_lock_file" \
+        "$localadmin_bin" ctl \
+            --port "$localadmin_port" \
+            --base-name "$localadmin_pipe_base" \
+            "$@"
+}
+
+if [ "$(id -un)" = "$localadmin_user" ]; then
+    run_client "$@"
+fi
+
+# PipeOptions.CurrentUserOnly deliberately requires the client to run as the service account.
+# -n makes automation fail clearly instead of hanging on a sudo password prompt.
+exec sudo -n -H -u "$localadmin_user" -- \
+    flock -E 75 -w "$localadmin_lock_timeout" "$localadmin_lock_file" \
+        "$localadmin_bin" ctl \
+            --port "$localadmin_port" \
+            --base-name "$localadmin_pipe_base" \
+            "$@"

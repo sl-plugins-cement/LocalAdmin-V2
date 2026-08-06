@@ -1,7 +1,7 @@
 ﻿#if LINUX_SIGNALS
-using Mono.Unix;
-using Mono.Unix.Native;
 using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
 using System.Threading;
 
 namespace LocalAdmin.V2.IO.ExitHandlers
@@ -12,25 +12,33 @@ namespace LocalAdmin.V2.IO.ExitHandlers
     internal sealed class UnixHandler : IExitHandler
     {
         public static readonly UnixHandler Handler = new UnixHandler();
-        private static readonly UnixSignal[] Signals = {
-            new UnixSignal(Signum.SIGINT),  // CTRL + C pressed
-            new UnixSignal(Signum.SIGTERM), // Sending KILL
-            new UnixSignal(Signum.SIGUSR1),
-            new UnixSignal(Signum.SIGUSR2),
-            new UnixSignal(Signum.SIGHUP)   // Terminal is closed
-        };
-
+        private readonly List<PosixSignalRegistration> _registrations = new();
+        private int _handled;
 
         public void Setup()
         {
-            new Thread(() =>
+            Register(PosixSignal.SIGINT);
+            Register(PosixSignal.SIGTERM);
+            Register(PosixSignal.SIGHUP);
+        }
+
+        private void Register(PosixSignal signal)
+        {
+            _registrations.Add(PosixSignalRegistration.Create(signal, context =>
             {
-                // Blocking operation with infinite expectation of any signal
-                UnixSignal.WaitAny(Signals, -1);
+                // Prevent the runtime's default termination so LocalAdmin can ask the game to
+                // exit and finish its normal teardown. systemd still has SIGKILL as a bounded
+                // fallback if that graceful path stalls.
+                context.Cancel = true;
+
+                if (Interlocked.Exchange(ref _handled, 1) != 0)
+                    return;
+
                 if (Core.LocalAdmin.Singleton == null)
                     Environment.Exit(0);
-                else Core.LocalAdmin.HandleExitSignal();
-            }).Start();
+                else
+                    Core.LocalAdmin.HandleExitSignal();
+            }));
         }
     }
 }
