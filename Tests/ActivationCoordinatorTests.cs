@@ -98,6 +98,24 @@ public sealed class ActivationCoordinatorTests : IDisposable
     }
 
     [Fact]
+    public async Task Failed_Pending_Verification_With_Null_Checkpoint_Enters_Rollback()
+    {
+        // The real scpsl-ops hook reports a FAILED verify-runtime with checkpoint null (there is
+        // no finalized manifest). The staged candidate must stay in pending_checkpoint and the
+        // failure must convert into the single rollback; nulling it crashed the verification task
+        // and stranded the lane in verifying (found by the local E2E).
+        var setup = await SetupActivatingAsync();
+        setup.Hooks.VerifyPendingOk = false;
+        setup.Hooks.NullCheckpointOnFailure = true;
+        await setup.Coordinator.ResumeBeforeChildAsync();
+        await setup.Coordinator.OnChildStartedAsync();
+
+        var rollingBack = await WaitForStateAsync(setup.Store, ActivationStates.RollingBack);
+        Assert.Equal(Pending, rollingBack.PendingCheckpoint);
+        Assert.True(rollingBack.RollbackAttempted);
+    }
+
+    [Fact]
     public async Task Cancelled_Pending_Cleans_Stage_And_Releases_Lock()
     {
         var setup = await SetupActivatingAsync(stopAtPending: true);
@@ -166,6 +184,7 @@ public sealed class ActivationCoordinatorTests : IDisposable
         internal readonly List<string> Phases = new();
         internal bool VerifyPendingOk = true;
         internal bool VerifyPreviousOk = true;
+        internal bool NullCheckpointOnFailure;
 
         public Task<ActivationHookResult> RunAsync(string phase, ActivationRecord record, CancellationToken cancellationToken)
         {
@@ -179,7 +198,9 @@ public sealed class ActivationCoordinatorTests : IDisposable
                 Ok = ok,
                 ActivationId = record.ActivationId,
                 Phase = phase,
-                Checkpoint = isPrevious ? record.PreviousCheckpoint : record.PendingCheckpoint,
+                Checkpoint = !ok && NullCheckpointOnFailure
+                    ? null
+                    : isPrevious ? record.PreviousCheckpoint : record.PendingCheckpoint,
                 Checks = new(),
                 Error = ok ? null : "simulated readiness failure"
             });

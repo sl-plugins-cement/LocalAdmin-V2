@@ -429,9 +429,14 @@ internal sealed class ActivationCoordinator
             }, cancellationToken).ConfigureAwait(false);
 
             var hook = await RunHookSafeAsync("verify-runtime", latest, cancellationToken).ConfigureAwait(false);
+            // A FAILED verify-runtime returns no finalized checkpoint. The staged candidate must
+            // stay in pending_checkpoint so the record remains valid and the failure converts
+            // into the single rollback instead of crashing this verification task.
             latest = await _store.UpdateAsync(latest.Revision, record => record! with
             {
-                PendingCheckpoint = target == "pending" ? hook.Checkpoint : record.PendingCheckpoint,
+                PendingCheckpoint = target == "pending" && hook.Ok && hook.Checkpoint != null
+                    ? hook.Checkpoint
+                    : record.PendingCheckpoint,
                 Checks = Append(record.Checks, hook.Checks)
             }, cancellationToken).ConfigureAwait(false);
 
