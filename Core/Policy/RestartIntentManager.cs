@@ -10,6 +10,11 @@ using LocalAdmin.V2.IO;
 
 namespace LocalAdmin.V2.Core.Policy;
 
+internal readonly record struct RestartIntentSnapshot(string? Preset, bool Firing)
+{
+    internal bool Exists => Preset != null;
+}
+
 /// <summary>
 /// The single registry for the pending one-shot restart intent. Exactly one intent can be armed
 /// at a time; it persists across in-process child-game sessions (the manager outlives the
@@ -51,6 +56,21 @@ internal sealed class RestartIntentManager
 
     // Live per-session machinery (watchdog or gate poller). Recreated by RearmForNewSession.
     private CancellationTokenSource? _liveCts;
+
+    internal bool HasPending
+    {
+        get
+        {
+            lock (_lock)
+                return _pending != null;
+        }
+    }
+
+    internal RestartIntentSnapshot GetSnapshot()
+    {
+        lock (_lock)
+            return new RestartIntentSnapshot(_pending?.PresetName, _firing);
+    }
 
     internal bool TryArm(
         IRestartHost host,

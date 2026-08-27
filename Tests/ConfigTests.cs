@@ -19,6 +19,9 @@ public sealed class ConfigTests
             RecentActivityOverPlayers = 8,
             RecentActivityWindowMinutes = 45,
             CommandChannelPipeName = "MyPipe",
+            OpsLane = "oa/prod",
+            OpsStateRoot = "/var/lib/scpsl-ops-test",
+            OpsCliPath = "/usr/local/bin/scpsl-ops",
         };
 
         var roundTripped = Config.DeserializeConfig(cfg.SerializeConfig().Split('\n'));
@@ -32,6 +35,9 @@ public sealed class ConfigTests
         Assert.Equal(8, roundTripped.RecentActivityOverPlayers);
         Assert.Equal(45, roundTripped.RecentActivityWindowMinutes);
         Assert.Equal("MyPipe", roundTripped.CommandChannelPipeName);
+        Assert.Equal("oa/prod", roundTripped.OpsLane);
+        Assert.Equal("/var/lib/scpsl-ops-test", roundTripped.OpsStateRoot);
+        Assert.Equal("/usr/local/bin/scpsl-ops", roundTripped.OpsCliPath);
     }
 
     [Fact]

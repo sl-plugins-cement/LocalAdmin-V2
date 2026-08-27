@@ -9,7 +9,9 @@ public sealed class RestartPresetsTests
     public void All_Presets_Are_Valid()
     {
         foreach (var preset in RestartPresets.List)
+        {
             Assert.True(preset.Condition.Validate(out var error), $"{preset.Name}: {error}");
+        }
     }
 
     [Fact]
@@ -32,26 +34,38 @@ public sealed class RestartPresetsTests
     public void NextRoundLowpop_Gates_Below_Five_Players()
     {
         Assert.True(RestartPresets.TryGet("next-round-lowpop", out var preset));
-        Assert.Equal(RestartEdge.RoundEnd, preset.Condition.Edge);
-        Assert.Equal(4, preset.Condition.MaxPlayers);
+        var condition = Assert.IsType<RestartCondition>(preset.Condition);
+        Assert.Equal(RestartEdge.RoundEnd, condition.Edge);
+        Assert.Equal(4, condition.MaxPlayers);
+    }
+
+    [Fact]
+    public void NextRound_Is_A_Tracked_Cancellable_Intent()
+    {
+        Assert.True(RestartPresets.TryGet("next-round", out var preset));
+        var condition = Assert.IsType<RestartCondition>(preset.Condition);
+        Assert.Equal(RestartEdge.RoundEnd, condition.Edge);
+        Assert.Equal(1, condition.Rounds);
     }
 
     [Fact]
     public void Empty_Requires_Sustained_HalfHour()
     {
         Assert.True(RestartPresets.TryGet("empty", out var preset));
-        Assert.Equal(RestartEdge.LowActivityTick, preset.Condition.Edge);
-        Assert.Equal(0, preset.Condition.MaxPlayers);
-        Assert.Equal(1800, preset.Condition.SustainedSeconds);
+        var condition = Assert.IsType<RestartCondition>(preset.Condition);
+        Assert.Equal(RestartEdge.LowActivityTick, condition.Edge);
+        Assert.Equal(0, condition.MaxPlayers);
+        Assert.Equal(1800, condition.SustainedSeconds);
     }
 
     [Fact]
     public void Low30m_Requires_Sustained_HalfHour()
     {
         Assert.True(RestartPresets.TryGet("low-30m", out var preset));
-        Assert.Equal(RestartEdge.LowActivityTick, preset.Condition.Edge);
-        Assert.Equal(1, preset.Condition.MaxPlayers);
-        Assert.Equal(1800, preset.Condition.SustainedSeconds);
+        var condition = Assert.IsType<RestartCondition>(preset.Condition);
+        Assert.Equal(RestartEdge.LowActivityTick, condition.Edge);
+        Assert.Equal(1, condition.MaxPlayers);
+        Assert.Equal(1800, condition.SustainedSeconds);
     }
 
     [Fact]

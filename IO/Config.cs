@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Text;
 
 namespace LocalAdmin.V2.IO;
@@ -43,6 +44,13 @@ public class Config
     public string LaLiveViewTimeFormat = "yyyy-MM-dd HH:mm:ss.fff zzz";
     public string CommandChannelPipeName = "LocalAdmin-Console";
     public string ServerApplicationPath = string.Empty;
+    // Managed activation is disabled until a lane is assigned. The CLI path must be absolute so
+    // LocalAdmin never resolves a deployment hook through a mutable service PATH.
+    public string OpsLane = string.Empty;
+    public string OpsStateRoot = OperatingSystem.IsWindows()
+        ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "scpsl-ops")
+        : "/var/lib/scpsl-ops";
+    public string OpsCliPath = string.Empty;
 
     public string SerializeConfig()
     {
@@ -125,6 +133,15 @@ public class Config
 
         sb.Append("server_application_path: ");
         sb.AppendLine(ServerApplicationPath);
+
+        sb.Append("ops_lane: ");
+        sb.AppendLine(OpsLane);
+
+        sb.Append("ops_state_root: ");
+        sb.AppendLine(OpsStateRoot);
+
+        sb.Append("ops_cli_path: ");
+        sb.AppendLine(OpsCliPath);
 
         sb.Append("auto_restart_empty_enabled: ");
         sb.AppendLine(AutoRestartEmptyEnabled.ToString().ToLowerInvariant());
@@ -275,6 +292,18 @@ public class Config
                     cfg.ServerApplicationPath = sp[1].Trim();
                     break;
 
+                case "ops_lane":
+                    cfg.OpsLane = sp[1].Trim();
+                    break;
+
+                case "ops_state_root":
+                    cfg.OpsStateRoot = sp[1].Trim();
+                    break;
+
+                case "ops_cli_path":
+                    cfg.OpsCliPath = sp[1].Trim();
+                    break;
+
                 case "auto_restart_empty_enabled" when bool.TryParse(sp[1], out var b):
                     cfg.AutoRestartEmptyEnabled = b;
                     break;
@@ -385,6 +414,10 @@ public class Config
         sb.AppendLine(string.IsNullOrWhiteSpace(ServerApplicationPath)
             ? "- Server application path is not configured; LocalAdmin will auto-discover it."
             : $"- Server application path is configured as: {ServerApplicationPath}");
+
+        sb.AppendLine(string.IsNullOrWhiteSpace(OpsLane)
+            ? "- Managed activation is DISABLED (ops_lane is empty)."
+            : $"- Managed activation lane: {OpsLane}; state root: {OpsStateRoot}; CLI: {OpsCliPath}");
 
         if (AutoRestartEmptyEnabled)
         {

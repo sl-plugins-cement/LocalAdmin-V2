@@ -9,19 +9,26 @@ using System.Linq;
 namespace LocalAdmin.V2.Core.Policy;
 
 /// <summary>
-/// Predefined restart conditions, so a runtime operator (human or agent) selects a vetted preset
-/// by name instead of authoring raw condition parameters. Presets are the ONLY way the
-/// <c>restartwhen</c> command arms an intent; legacy commands map onto presets too.
+/// Predefined restart actions, so a runtime operator (human or agent) selects a vetted preset by
+/// name instead of authoring raw condition parameters. Every action arms a LocalAdmin-managed,
+/// readable, cancellable intent.
 /// </summary>
 internal static class RestartPresets
 {
-    internal sealed record Preset(string Name, string Summary, RestartCondition Condition);
+    /// <summary>
+    /// A preset is implemented by the LocalAdmin intent manager so status and cancellation have
+    /// one deterministic owner.
+    /// </summary>
+    internal sealed record Preset(
+        string Name,
+        string Summary,
+        RestartCondition Condition);
 
     // Ordered so "restartwhen list" prints a stable, curated catalog.
     private static readonly Preset[] All =
     {
         new("next-round",
-            "Restart on the next round restart, regardless of player count.",
+            "Restart after the current round through the cancellable LocalAdmin intent.",
             new RestartCondition { Edge = RestartEdge.RoundEnd }),
 
         new("next-round-lowpop",
