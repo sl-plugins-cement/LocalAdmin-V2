@@ -225,9 +225,22 @@ internal sealed partial class ActivationRecordStore
             before.State != ActivationStates.Verified)
             Fail("activation_id cannot change while an activation is open.");
 
-        if (after.Checks.Count < before.Checks.Count ||
+        // Checks are immutable evidence WITHIN one activation (protocol: "Existing check entries
+        // are immutable evidence within an activation"). verified -> prepared begins a NEW
+        // activation attempt, which starts with empty checks; the previous activation's evidence
+        // lives on in its committed revisions.
+        var startsNewActivation = before.State == ActivationStates.Verified &&
+                                  after.State == ActivationStates.Prepared;
+        if (startsNewActivation)
+        {
+            if (after.Checks.Count != 0)
+                Fail("A new activation attempt must start with empty readiness checks.");
+        }
+        else if (after.Checks.Count < before.Checks.Count ||
             !before.Checks.SequenceEqual(after.Checks.Take(before.Checks.Count)))
+        {
             Fail("Existing readiness checks are immutable and may only be appended.");
+        }
 
         if (before.State == after.State)
         {

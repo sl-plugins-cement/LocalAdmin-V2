@@ -105,6 +105,43 @@ public sealed class ActivationRecordStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task New_Activation_Resets_Checks_Retained_By_The_Verified_Record()
+    {
+        // A verified record keeps the previous activation's readiness evidence. Preparing the
+        // NEXT activation starts a fresh attempt whose checks are empty; append-only immutability
+        // applies within one activation, not across activations (proven by the scpsl-ops E2E:
+        // the second staged deploy on a lane was refused before this fix).
+        var store = new ActivationRecordStore(_root, "example/prod");
+        var verified = await store.UpdateAsync(-1, _ => Verified() with
+        {
+            Checks = new List<ActivationCheck> { Check("pending.players", true) }
+        });
+
+        var prepared = await store.UpdateAsync(
+            verified.Revision,
+            record => Open(record!, ActivationStates.Prepared));
+
+        Assert.Equal(ActivationStates.Prepared, prepared.State);
+        Assert.Empty(prepared.Checks);
+
+        // Within the open activation the append-only rule still holds.
+        var pending = await store.UpdateAsync(
+            prepared.Revision,
+            record => record! with
+            {
+                State = ActivationStates.Pending,
+                Checks = new List<ActivationCheck> { Check("pending.udp", true) }
+            });
+        await Assert.ThrowsAsync<ActivationProtocolException>(() => store.UpdateAsync(
+            pending.Revision,
+            record => record! with
+            {
+                State = ActivationStates.Activating,
+                Checks = new List<ActivationCheck> { Check("rewritten", false) }
+            }));
+    }
+
+    [Fact]
     public void Golden_Shapes_Validate()
     {
         var verified = Verified();
