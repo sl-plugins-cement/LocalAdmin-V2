@@ -802,7 +802,14 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost, IActivationHo
     {
         async void ReaderTaskMethod()
         {
-            while (!_exit)
+            // _exit is STATIC and the next session resets it to false within milliseconds of a
+            // scheduled restart. A reader polling every 65ms can miss that pulse entirely and
+            // survive its own session's teardown, after which TWO readers race on the static
+            // InputQueue and commands run against the dead session's state (observed live: a
+            // zombie reader executed "ops ... arm" and silently claimed the immediate restart on
+            // its closed session, stranding a managed activation). The instance-scoped
+            // _processClosing flag never resets, so it pins this reader to this session.
+            while (!_exit && !_processClosing)
             {
                 if (!InputQueue.TryDequeue(out var input))
                 {
