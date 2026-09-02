@@ -103,7 +103,7 @@ Set `recent_activity_window_minutes` to `0` to disable the recent-activity guard
 
 ## One-shot restart intents (`restartwhen`)
 
-The LocalAdmin command `restartwhen` arms a predefined one-shot restart condition by preset name, so an operator or runtime agent selects a vetted preset instead of authoring raw parameters. Exactly one intent can be armed at a time; it fires exactly once.
+The LocalAdmin command `restartwhen` requests a predefined restart action by preset name, so an operator or runtime agent selects a vetted preset instead of authoring raw parameters. A preset either forwards a native SCP:SL command or arms a LocalAdmin-managed one-shot condition. Exactly one LocalAdmin-managed intent can be armed at a time; it fires exactly once.
 
 ```text
 restartwhen <preset>
@@ -116,13 +116,17 @@ Presets (see `restartwhen list` for the live catalog):
 
 | Preset             | Fires |
 | ------------------ | ----- |
-| `next-round`       | On the next round restart, regardless of player count. |
+| `next-round`       | Passes SCP:SL's native `rnr` command through to the game. |
 | `next-round-lowpop`| On the next round restart that ends with fewer than 5 players; otherwise waits for a later round. |
 | `empty`            | Once the server has been empty for 30 sustained minutes. |
 | `low-30m`          | Once fewer than 2 players have been on for 30 sustained minutes. |
 | `quiet-hour`       | As `low-30m`, and additionally the last hour never peaked above 4 players. |
 
 Conditions combine one **edge** (the event that evaluates the intent: a round restart, or a low-activity watchdog tick) with optional **gates** (state checks at that moment, e.g. a fresh player count at or below a threshold). A player-gated round preset only acts on a fresh authoritative player count; if none is available at the round edge, it skips that round rather than restart on stale data.
+
+`next-round` is intentionally the exception to LocalAdmin-managed intents: arming it only forwards
+the native `rnr` command. SCP:SL owns that pending restart, so `restartwhen status` and
+`restartwhen cancel` do not report or alter it. LocalAdmin does not keep duplicate next-round state.
 
 ### Custom presets (JSON files)
 
@@ -149,7 +153,7 @@ Fields (all optional except `edge`; unknown fields are rejected so typos fail lo
 
 Invalid files are listed with their parse error in `restartwhen list` instead of being silently skipped.
 
-The armed intent **persists across child-game session restarts while the same LocalAdmin process remains alive** (a crash, heartbeat restart, or round restart re-arms it in the next session) until it fires or is canceled, and arming refuses to replace an already armed intent until `restartwhen cancel` is run. The intent is held in memory: a LocalAdmin/systemd restart or host reboot loses it, so check `restartwhen status` and re-arm afterward. An intent is consumed only when a graceful restart is actually committed; if a crash or another shutdown wins the race, the intent stays armed and retries.
+A LocalAdmin-managed armed intent **persists across child-game session restarts while the same LocalAdmin process remains alive** (a crash, heartbeat restart, or round restart re-arms it in the next session) until it fires or is canceled, and arming refuses to replace an already armed intent until `restartwhen cancel` is run. The intent is held in memory: a LocalAdmin/systemd restart or host reboot loses it, so check `restartwhen status` and re-arm afterward. An intent is consumed only when a graceful restart actually commits; if a crash or another shutdown wins the race, the intent stays armed and retries. `next-round` uses the same LocalAdmin-managed, cancellable intent, so its status can be read back exactly before the CLI reports success.
 
 Examples through the native command-channel client:
 
@@ -159,6 +163,47 @@ Examples through the native command-channel client:
 ./LocalAdmin ctl 7777 localadmin restartwhen status
 ./LocalAdmin ctl 7777 localadmin restartwhen cancel
 ```
+
+## Managed activation supervision
+
+This fork can supervise durable `scpsl-ops` activations. LocalAdmin owns the activation record,
+restart timing, readiness checks, and the single automatic rollback. It does not read checkpoint
+manifests or copy deployment files. Those operations stay in the fixed `scpsl-ops internal
+activation` commands, so there is only one checkpoint implementation.
+
+Managed activation is disabled when `ops_lane` is empty. To enable it, set all three values in the
+LocalAdmin config:
+
+```text
+ops_lane: oa/prod
+ops_state_root: /var/lib/scpsl-ops
+ops_cli_path: /usr/local/bin/scpsl-ops
+```
+
+`ops_state_root` and `ops_cli_path` must be absolute. The default state root is
+`/var/lib/scpsl-ops` on Linux and `C:\ProgramData\scpsl-ops` on Windows. On first setup, LocalAdmin
+holds the child stopped until `scpsl-ops` asks it to bootstrap the initial verified record. Once a
+lane is configured, a missing, malformed, or unsupported record never starts the game by guessing.
+
+The record lives at `lanes/<host>/<lane>/activation.json` below the state root. LocalAdmin writes a
+complete temporary file, flushes it, and atomically replaces the record. Every write checks and
+increments the record revision. A LocalAdmin restart resumes `pending`, `activating`, `verifying`,
+or `rolling-back` from that file.
+
+Readiness requires the child process, console connection, configured heartbeat, configured UDP
+listener, and a correlated `players` response. The probe accepts a valid zero-player response and
+never has two `players` requests in flight. The runtime hook adds managed-file, loader, and server
+verification checks.
+
+If the candidate fails, LocalAdmin restores the previous checkpoint once. If the previous
+checkpoint also fails readiness, the record enters `recovery-required`, the child remains stopped,
+and the lock and evidence remain intact. There is no rollback loop. After explicit repair,
+`scpsl-ops recovery adopt` records the repaired checkpoint and starts a fresh session.
+
+The existing command channel carries the private machine protocol. Requests begin with `ops` and a
+UUID. Responses are one compact JSON line prefixed with `@@SCPSL_OPS_V1@@`, so a client can ignore
+unrelated console output. Operators should use `scpsl-ops`; the raw `ops` command is an integration
+surface, not a second user interface.
 
 ## Build and publish
 

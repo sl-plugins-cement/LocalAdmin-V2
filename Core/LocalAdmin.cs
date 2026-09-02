@@ -14,6 +14,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using LocalAdmin.V2.Commands.PluginManager;
 using LocalAdmin.V2.Core.CommandChannel;
+using LocalAdmin.V2.Core.Activation;
 using LocalAdmin.V2.Core.Policy;
 using LocalAdmin.V2.IO.Logging;
 using LocalAdmin.V2.PluginsManager;
@@ -30,7 +31,7 @@ namespace LocalAdmin.V2.Core;
     * Blue - normal SCPSL log
 */
 
-public sealed class LocalAdmin : IDisposable, Policy.IRestartHost
+public sealed class LocalAdmin : IDisposable, Policy.IRestartHost, IActivationHost
 {
     public const string VersionString = "2.5.17";
     private const ushort DefaultPort = 7777;
@@ -62,7 +63,10 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost
     private static ConsoleInputPump? _keyboardInputPump;
     private readonly PlayerCountTracker _playerTracker = new();
     internal PlayerCountTracker PlayerTracker => _playerTracker;
+    private readonly PlayerProbeCoordinator _playerProbe;
     private CancellationTokenSource? _policyCts;
+    private ActivationCoordinator? _activation;
+    private string? _activationInitializationError;
 
     // The single pending one-shot restart intent. Static so it survives an in-process session
     // restart (Program.cs creates a fresh LocalAdmin per session); the manager is re-armed each
@@ -130,6 +134,8 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost
 
     internal LocalAdmin()
     {
+        _playerProbe = new PlayerProbeCoordinator(_playerTracker, SendPlayersProbe);
+
         if (OperatingSystem.IsWindows())
             _scpslExecutable = "SCPSL.exe";
         else if (OperatingSystem.IsLinux())
@@ -565,19 +571,38 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost
                 StartCommandChannel();
             }
 
+            ConfigureManagedActivation();
             RegisterCommands();
             SetupReader();
 
             // Fresh per-session player-count state, then arm the restart-when-empty watchdog.
+            _playerProbe.ResetSession();
             _playerTracker.Reset();
-            StartRestartWhenEmptyPolicy();
+            ActivationResumeResult? activationResume = null;
+            if (_activation != null)
+                activationResume = await _activation.ResumeBeforeChildAsync().ConfigureAwait(false);
+            else if (_activationInitializationError != null)
+                activationResume = new ActivationResumeResult(false, _activationInitializationError, null);
+
+            if (activationResume is not { LaunchGame: false })
+                StartRestartWhenEmptyPolicy();
 
             // Re-arm any one-shot restart intents carried over from a previous session.
-            RearmPendingRestartIntent();
-
-            StartSession();
+            if (activationResume is not { LaunchGame: false })
+                RearmPendingRestartIntent();
 
             _readerTask!.Start();
+
+            if (activationResume is { LaunchGame: false } hold)
+            {
+                ConsoleUtil.WriteLine($"Game child held stopped by managed activation: {hold.Message}", ConsoleColor.Red);
+            }
+            else
+            {
+                StartSession();
+                if (_activation != null)
+                    await _activation.OnChildStartedAsync().ConfigureAwait(false);
+            }
 
             if (autoEula)
                 ConsoleUtil.WriteLine("SCP: Secret Laboratory EULA (https://link.scpslgame.com/eula) was accepted by providing a startup argument or setting an environment variable.", ConsoleColor.Yellow);
@@ -777,9 +802,14 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost
     {
         async void ReaderTaskMethod()
         {
-            while (Server == null) await Task.Delay(20);
-
-            while (!_exit)
+            // _exit is STATIC and the next session resets it to false within milliseconds of a
+            // scheduled restart. A reader polling every 65ms can miss that pulse entirely and
+            // survive its own session's teardown, after which TWO readers race on the static
+            // InputQueue and commands run against the dead session's state (observed live: a
+            // zombie reader executed "ops ... arm" and silently claimed the immediate restart on
+            // its closed session, stranding a managed activation). The instance-scoped
+            // _processClosing flag never resets, so it pins this reader to this session.
+            while (!_exit && !_processClosing)
             {
                 if (!InputQueue.TryDequeue(out var input))
                 {
@@ -830,13 +860,14 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost
                     exit = true;
                 }
 
-                if (Server.Connected)
+                if (Server is { Connected: true } server)
                 {
                     // Correlate a manually typed "players" command with its list reply so the
                     // tracker accepts it (unsolicited list-shaped lines are untrusted).
                     if (name == "PLAYERS")
-                        _playerTracker.NotePlayersPollIssued();
-                    Server.WriteLine(input);
+                        RequestPlayerCountRefresh();
+                    else
+                        server.WriteLine(input);
                 }
                 else
                     ConsoleUtil.WriteLine("Failed to send command - connection to server process hasn't been established yet.", ConsoleColor.Yellow);
@@ -1001,6 +1032,16 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost
                 if (_processClosing)
                     return;
 
+                try
+                {
+                    if (_activation?.OnChildExitedAsync().GetAwaiter().GetResult() is true)
+                        ClaimExitAction(ShutdownAction.Restart);
+                }
+                catch (Exception ex)
+                {
+                    ConsoleUtil.WriteLine($"Failed to record managed activation child exit: {ex.Message}", ConsoleColor.Red);
+                }
+
                 switch (ExitAction)
                 {
                     case ShutdownAction.Crash:
@@ -1059,6 +1100,8 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost
         CommandService.RegisterCommand(new PluginManagerCommand());
         CommandService.RegisterCommand(new LaCfgCommand());
         CommandService.RegisterCommand(new ExitCommand());
+        if (_activation != null)
+            CommandService.RegisterCommand(new OpsCommand(_activation));
     }
 
     private static void ReadInput(Func<string?, bool> checkInput, Action validInputAction, Action invalidInputAction)
@@ -1103,6 +1146,7 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost
             try { _policyCts?.Cancel(); }
             catch { /* ignore */ }
             RestartIntents.StopForSessionEnd();
+            _activation?.StopForSessionEnd();
 
             LogCleaner.Abort();
             Logger.EndLogging();
@@ -1224,13 +1268,20 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost
     /// </summary>
     public void RequestPlayerCountRefresh()
     {
-        var server = Server;
-        if (server is { Connected: true })
-        {
-            _playerTracker.NotePlayersPollIssued();
-            server.WriteLine("players");
-        }
+        _ = _playerProbe.ProbeAsync(TimeSpan.FromSeconds(10)).ContinueWith(
+            static _ => { },
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
     }
+
+    internal Task<PlayerProbeResult> ProbePlayersAsync(TimeSpan timeout, CancellationToken cancellationToken = default)
+        => _playerProbe.ProbeAsync(timeout, cancellationToken);
+
+    Task<PlayerProbeResult> IActivationHost.ProbePlayersAsync(TimeSpan timeout, CancellationToken cancellationToken) =>
+        ProbePlayersAsync(timeout, cancellationToken);
+
+    private bool SendPlayersProbe() => Server is { Connected: true } server && server.WriteLine("players");
 
     // A graceful restart has already been committed (someone owns the ShutdownAction.Restart and its
     // retry/force fallback). Arming a new one-shot now must be refused so it cannot cancel the live
@@ -1274,6 +1325,35 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost
         return true;
     }
 
+    /// <summary>
+    /// Atomically reserves this session's lifecycle for a managed activation and commits the
+    /// durable pending -&gt; activating transition before asking the game to exit. Holding the
+    /// lifecycle lock across the record commit prevents an unrelated crash/shutdown from winning
+    /// between those two operations; if another exit already owns the session, the record remains
+    /// pending and can be re-armed later.
+    /// </summary>
+    public bool TryScheduleManagedActivationRestart(string reason, Func<bool> commitActivation)
+    {
+        lock (this)
+        {
+            if (_processClosing || _exit || DisableExitActionSignals)
+                return false;
+            try
+            {
+                if (_gameProcess is not { HasExited: false })
+                    return false;
+            }
+            catch
+            {
+                return false;
+            }
+            if (!commitActivation())
+                return false;
+
+            return RequestScheduledRestart(reason) && ExitAction == ShutdownAction.Restart;
+        }
+    }
+
     /// <summary>Re-arms a one-shot restart intent carried over from a previous in-process session.</summary>
     private void RearmPendingRestartIntent() => RestartIntents.RearmForNewSession(this, _playerTracker);
 
@@ -1290,6 +1370,7 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost
         }
 
         RestartIntents.NotifyRoundRestart(this, _playerTracker);
+        _activation?.NotifyRoundRestart();
     }
 
     /// <summary>
@@ -1420,7 +1501,9 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost
         // own console output (help, errors, the ">>> input" echo), not just game lines.
         try
         {
-            _playerTracker.ProcessConsoleLine(strippedLine);
+            _playerTracker.ProcessConsoleLine(strippedLine, DateTime.UtcNow, out var acceptedPlayersReply);
+            if (acceptedPlayersReply.HasValue)
+                _playerProbe.AcceptReply(acceptedPlayersReply.Value, DateTime.UtcNow);
         }
         catch
         {
@@ -1431,6 +1514,71 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost
     internal void NotifyIdleEnter() => _playerTracker.NotifyIdleEnter();
 
     internal void NotifyIdleExit() => _playerTracker.NotifyIdleExit();
+
+    bool IActivationHost.GameProcessRunning => _gameProcess is { HasExited: false };
+
+    bool IActivationHost.GameConsoleConnected => Server is { Connected: true };
+
+    bool IActivationHost.StartupHeartbeatReady =>
+        EnableGameHeartbeat && CurrentHeartbeatStatus == HeartbeatStatus.Active;
+
+    bool IActivationHost.IsGameUdpPortBound() => IsGameUdpPortBound();
+
+    void IActivationHost.ForceActivationSessionRestart(string reason) => ForceScheduledRestart(reason);
+
+    private static bool IsGameUdpPortBound()
+    {
+        try
+        {
+            return System.Net.NetworkInformation.IPGlobalProperties.GetIPGlobalProperties()
+                .GetActiveUdpListeners()
+                .Any(endpoint => endpoint.Port == GamePort);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private void ConfigureManagedActivation()
+    {
+        _activation = null;
+        _activationInitializationError = null;
+        if (Configuration == null || string.IsNullOrWhiteSpace(Configuration.OpsLane))
+            return;
+
+        try
+        {
+            var store = new ActivationRecordStore(Configuration.OpsStateRoot, Configuration.OpsLane);
+            var hooks = new ActivationHookRunner(Configuration.OpsCliPath);
+            _activation = new ActivationCoordinator(store, hooks, this, _playerTracker);
+        }
+        catch (Exception ex)
+        {
+            _activationInitializationError = "Managed activation configuration is invalid: " + ex.Message;
+        }
+    }
+
+    internal bool ManagedActivationBlocksRestartIntent(out string state)
+    {
+        state = string.Empty;
+        if (_activation == null)
+            return false;
+
+        try
+        {
+            var record = _activation.GetStatusAsync().GetAwaiter().GetResult();
+            if (record == null || record.State == ActivationStates.Verified)
+                return false;
+            state = record.State;
+            return true;
+        }
+        catch
+        {
+            state = "unreadable";
+            return true;
+        }
+    }
 
     internal void HandleHeartbeat()
     {

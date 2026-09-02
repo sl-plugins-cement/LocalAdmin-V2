@@ -162,10 +162,19 @@ internal sealed class PlayerCountTracker
     /// Feeds a single console line (already stripped of its color prefix). Returns true if the
     /// authoritative count changed as a result.
     /// </summary>
-    internal bool ProcessConsoleLine(string line) => ProcessConsoleLine(line, DateTime.UtcNow);
+    internal bool ProcessConsoleLine(string line) => ProcessConsoleLine(line, DateTime.UtcNow, out _);
 
-    internal bool ProcessConsoleLine(string line, DateTime nowUtc)
+    internal bool ProcessConsoleLine(string line, DateTime nowUtc) => ProcessConsoleLine(line, nowUtc, out _);
+
+    /// <summary>
+    /// As above, with the accepted response count exposed separately from the "count changed"
+    /// return value. A correlated probe must complete even when two consecutive replies contain
+    /// the same count.
+    /// </summary>
+    internal bool ProcessConsoleLine(string line, DateTime nowUtc, out int? acceptedPlayersReply)
     {
+        acceptedPlayersReply = null;
+
         if (string.IsNullOrEmpty(line))
             return false;
 
@@ -199,6 +208,7 @@ internal sealed class PlayerCountTracker
                 if (listCount == 0)
                     _players.Clear();
 
+                acceptedPlayersReply = listCount;
                 return changed;
             }
         }

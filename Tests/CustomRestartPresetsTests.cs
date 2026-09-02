@@ -69,7 +69,7 @@ public sealed class CustomRestartPresetsTests : IDisposable
 
         Assert.True(CustomRestartPresets.TryLoad(_dir, "late-night", out var preset, out _));
         Assert.Equal("late-night", preset.Name);
-        Assert.Equal(2, preset.Condition.MaxPlayers);
+        Assert.Equal(2, Assert.IsType<RestartCondition>(preset.Condition).MaxPlayers);
     }
 
     [Fact]
@@ -115,7 +115,8 @@ public sealed class CustomRestartPresetsTests : IDisposable
         Write("next-round", """{ "edge": "round-end", "maxPlayers": 0 }""");
 
         Assert.True(RestartPresets.TryResolve("next-round", _dir, out var preset, out _));
-        Assert.Null(preset.Condition.MaxPlayers); // built-in next-round has no player gate
+        var condition = Assert.IsType<RestartCondition>(preset.Condition);
+        Assert.Null(condition.MaxPlayers); // built-in next-round cannot be shadowed
     }
 
     [Fact]
@@ -124,6 +125,6 @@ public sealed class CustomRestartPresetsTests : IDisposable
         Write("my-preset", """{ "edge": "low-activity", "maxPlayers": 3, "sustainedSeconds": 300 }""");
 
         Assert.True(RestartPresets.TryResolve("my-preset", _dir, out var preset, out _));
-        Assert.Equal(3, preset.Condition.MaxPlayers);
+        Assert.Equal(3, Assert.IsType<RestartCondition>(preset.Condition).MaxPlayers);
     }
 }

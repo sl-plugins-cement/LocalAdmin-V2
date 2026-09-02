@@ -48,9 +48,9 @@ public sealed class RestartIntentManagerTests
         var host = new FakeHost();
         var tracker = new PlayerCountTracker();
 
-        Assert.True(manager.TryArm(host, tracker, "next-round", RoundCondition(), out var armMessage));
-        Assert.Contains("next-round", armMessage);
-        Assert.Contains("next-round", manager.GetStatus(tracker));
+        Assert.True(manager.TryArm(host, tracker, "custom-round", RoundCondition(), out var armMessage));
+        Assert.Contains("custom-round", armMessage);
+        Assert.Contains("custom-round", manager.GetStatus(tracker));
 
         Assert.True(manager.TryCancel(host, out _));
         Assert.Contains("No restart intent", manager.GetStatus(tracker));
@@ -63,7 +63,7 @@ public sealed class RestartIntentManagerTests
         var host = new FakeHost();
         var tracker = new PlayerCountTracker();
 
-        Assert.True(manager.TryArm(host, tracker, "next-round", RoundCondition(), out _));
+        Assert.True(manager.TryArm(host, tracker, "custom-round", RoundCondition(), out _));
         Assert.False(manager.TryArm(host, tracker, "round-empty-gated", RoundCondition(0), out var message));
         Assert.Contains("already armed", message);
     }
@@ -74,8 +74,8 @@ public sealed class RestartIntentManagerTests
         var manager = new RestartIntentManager();
         var tracker = new PlayerCountTracker();
 
-        Assert.False(manager.TryArm(new FakeHost { ShuttingDown = true }, tracker, "next-round", RoundCondition(), out _));
-        Assert.False(manager.TryArm(new FakeHost { RestartOwned = true }, tracker, "next-round", RoundCondition(), out _));
+        Assert.False(manager.TryArm(new FakeHost { ShuttingDown = true }, tracker, "custom-round", RoundCondition(), out _));
+        Assert.False(manager.TryArm(new FakeHost { RestartOwned = true }, tracker, "custom-round", RoundCondition(), out _));
     }
 
     [Fact]
@@ -85,7 +85,7 @@ public sealed class RestartIntentManagerTests
         var host = new FakeHost();
         var tracker = new PlayerCountTracker();
 
-        Assert.True(manager.TryArm(host, tracker, "next-round", RoundCondition(), out _));
+        Assert.True(manager.TryArm(host, tracker, "custom-round", RoundCondition(), out _));
         manager.NotifyRoundRestart(host, tracker, T0);
 
         Assert.Equal(1, host.ScheduledRestarts);
@@ -99,7 +99,7 @@ public sealed class RestartIntentManagerTests
         var host = new FakeHost();
         var tracker = new PlayerCountTracker();
 
-        Assert.True(manager.TryArm(host, tracker, "next-round", RoundCondition(rounds: 3), out _));
+        Assert.True(manager.TryArm(host, tracker, "custom-three-rounds", RoundCondition(rounds: 3), out _));
 
         manager.NotifyRoundRestart(host, tracker, T0);
         manager.NotifyRoundRestart(host, tracker, T0.AddMinutes(10));
@@ -162,11 +162,11 @@ public sealed class RestartIntentManagerTests
         var host = new FakeHost { AcceptRestart = false };
         var tracker = new PlayerCountTracker();
 
-        Assert.True(manager.TryArm(host, tracker, "next-round", RoundCondition(), out _));
+        Assert.True(manager.TryArm(host, tracker, "custom-round", RoundCondition(), out _));
         manager.NotifyRoundRestart(host, tracker, T0);
 
         Assert.Equal(0, host.ScheduledRestarts);
-        Assert.Contains("next-round", manager.GetStatus(tracker)); // retried on the next round
+        Assert.Contains("custom-round", manager.GetStatus(tracker)); // retried on the next round
     }
 
     [Fact]
@@ -177,7 +177,7 @@ public sealed class RestartIntentManagerTests
         var tracker = new PlayerCountTracker();
 
         RestartPresets.TryGet("empty", out var preset);
-        Assert.True(manager.TryArm(host, tracker, preset.Name, preset.Condition, out _));
+        Assert.True(manager.TryArm(host, tracker, preset.Name, Assert.IsType<RestartCondition>(preset.Condition), out _));
 
         manager.NotifyRoundRestart(host, tracker, T0);
         Assert.Equal(0, host.ScheduledRestarts);

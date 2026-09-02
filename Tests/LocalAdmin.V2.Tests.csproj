@@ -24,5 +24,10 @@
 
     <ItemGroup>
         <ProjectReference Include="..\LocalAdmin V2.csproj" />
+        <ProjectReference Include="HookFixture\LocalAdmin.HookFixture.csproj" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <Compile Remove="HookFixture\**\*.cs" />
     </ItemGroup>
 </Project>
