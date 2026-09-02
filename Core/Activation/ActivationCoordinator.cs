@@ -19,6 +19,7 @@ internal interface IActivationHost : IRestartHost
     bool StartupHeartbeatReady { get; }
     bool IsGameUdpPortBound();
     Task<PlayerProbeResult> ProbePlayersAsync(TimeSpan timeout, CancellationToken cancellationToken);
+    bool TryScheduleManagedActivationRestart(string reason, Func<bool> commitActivation);
     void ForceActivationSessionRestart(string reason);
 }
 
@@ -101,6 +102,7 @@ internal sealed class ActivationCoordinator
                     record = await _store.UpdateAsync(record.Revision, current => current! with
                     {
                         State = ActivationStates.Verifying,
+                        CurrentCheckpoint = current.PendingCheckpoint,
                         VerificationTarget = "pending",
                         Checks = Append(current.Checks, result.Checks),
                         LastError = null
@@ -423,12 +425,39 @@ internal sealed class ActivationCoordinator
 
             var latest = await _store.LoadAsync(cancellationToken).ConfigureAwait(false)
                          ?? throw new ActivationProtocolException("activation.json disappeared during readiness.");
+            if (!IsExpectedVerification(latest, initial.ActivationId, target))
+                return;
             latest = await _store.UpdateAsync(latest.Revision, record => record! with
             {
                 Checks = Append(record.Checks, checks)
             }, cancellationToken).ConfigureAwait(false);
 
-            var hook = await RunHookSafeAsync("verify-runtime", latest, cancellationToken).ConfigureAwait(false);
+            var remainingForHook = deadline - DateTime.UtcNow;
+            if (remainingForHook <= TimeSpan.Zero)
+            {
+                await FailReadinessAsync(latest, target, Array.Empty<ActivationCheck>(), "readiness deadline expired", cancellationToken).ConfigureAwait(false);
+                return;
+            }
+
+            using var hookDeadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            hookDeadline.CancelAfter(remainingForHook);
+            var hook = await RunHookSafeAsync("verify-runtime", latest, hookDeadline.Token).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (hookDeadline.IsCancellationRequested || DateTime.UtcNow >= deadline)
+            {
+                await FailReadinessAsync(latest, target, hook.Checks, "readiness deadline expired", cancellationToken).ConfigureAwait(false);
+                return;
+            }
+
+            if (hook.Ok && initial.Readiness.RequireVerification && !HasSuccessfulServerVerification(hook.Checks))
+            {
+                hook = hook with
+                {
+                    Ok = false,
+                    Error = "runtime verification did not prove the server verification state"
+                };
+            }
+
             // A FAILED verify-runtime returns no finalized checkpoint. The staged candidate must
             // stay in pending_checkpoint so the record remains valid and the failure converts
             // into the single rollback instead of crashing this verification task.
@@ -437,6 +466,9 @@ internal sealed class ActivationCoordinator
                 PendingCheckpoint = target == "pending" && hook.Ok && hook.Checkpoint != null
                     ? hook.Checkpoint
                     : record.PendingCheckpoint,
+                CurrentCheckpoint = target == "pending" && hook.Ok && hook.Checkpoint != null
+                    ? hook.Checkpoint
+                    : record.CurrentCheckpoint,
                 Checks = Append(record.Checks, hook.Checks)
             }, cancellationToken).ConfigureAwait(false);
 
@@ -476,10 +508,24 @@ internal sealed class ActivationCoordinator
         CancellationToken cancellationToken)
     {
         var latest = await _store.LoadAsync(cancellationToken).ConfigureAwait(false) ?? stale;
+        if (!string.Equals(latest.ActivationId, stale.ActivationId, StringComparison.Ordinal))
+            return;
+        if (latest.State == ActivationStates.Verified)
+            return;
         if (target == "pending")
-            await EnterRollbackAsync(latest, error, checks, cancellationToken).ConfigureAwait(false);
+        {
+            if (latest.State == ActivationStates.Verifying)
+                await EnterRollbackAsync(latest, error, checks, cancellationToken).ConfigureAwait(false);
+            else if (latest.State is not (ActivationStates.RollingBack or ActivationStates.RecoveryRequired or ActivationStates.Verified))
+                throw new ActivationProtocolException($"Cannot fail pending readiness from state {latest.State}.");
+        }
         else
-            await EnterRecoveryAsync(latest, "rollback target failed readiness; game child stopped: " + error, checks, cancellationToken).ConfigureAwait(false);
+        {
+            if (latest.State == ActivationStates.RollingBack)
+                await EnterRecoveryAsync(latest, "rollback target failed readiness; game child stopped: " + error, checks, cancellationToken).ConfigureAwait(false);
+            else if (latest.State is not (ActivationStates.RecoveryRequired or ActivationStates.Verified))
+                throw new ActivationProtocolException($"Cannot fail rollback readiness from state {latest.State}.");
+        }
 
         _host.ForceActivationSessionRestart("managed activation readiness failed");
     }
@@ -490,8 +536,10 @@ internal sealed class ActivationCoordinator
         IReadOnlyCollection<ActivationCheck> checks,
         CancellationToken cancellationToken)
     {
-        if (record.RollbackAttempted)
-            return await EnterRecoveryAsync(record, "second rollback refused: " + error, checks, cancellationToken).ConfigureAwait(false);
+        if (record.State == ActivationStates.RollingBack && record.RollbackAttempted)
+            return record;
+        if (record.State != ActivationStates.Verifying && record.State != ActivationStates.Activating)
+            throw new ActivationProtocolException($"Cannot enter rollback from state {record.State}.");
 
         return await _store.UpdateAsync(record.Revision, current => current! with
         {
@@ -511,7 +559,6 @@ internal sealed class ActivationCoordinator
         _store.UpdateAsync(record.Revision, current => current! with
         {
             State = ActivationStates.RecoveryRequired,
-            CurrentCheckpoint = current.PreviousCheckpoint,
             VerificationTarget = "previous",
             RollbackAttempted = true,
             Checks = Append(current.Checks, checks),
@@ -582,6 +629,16 @@ internal sealed class ActivationCoordinator
         Detail = detail
     };
 
+    private static bool IsExpectedVerification(ActivationRecord record, string activationId, string target) =>
+        string.Equals(record.ActivationId, activationId, StringComparison.Ordinal) &&
+        (target == "pending"
+            ? record.State == ActivationStates.Verifying && record.VerificationTarget == "pending"
+            : record.State == ActivationStates.RollingBack && record.VerificationTarget == "previous");
+
+    private static bool HasSuccessfulServerVerification(IEnumerable<ActivationCheck> checks) =>
+        checks.Any(check => check.Ok &&
+                            string.Equals(check.Name, "runtime.verification-token", StringComparison.Ordinal));
+
     private sealed class ActivationRestartHost : IRestartHost
     {
         private readonly ActivationCoordinator _owner;
@@ -597,14 +654,17 @@ internal sealed class ActivationCoordinator
         {
             try
             {
-                var current = _owner._store.LoadAsync().GetAwaiter().GetResult();
-                if (current is not { State: ActivationStates.Pending })
-                    return false;
-                _owner._store.UpdateAsync(current.Revision, record => record! with
+                return _inner.TryScheduleManagedActivationRestart(reason, () =>
                 {
-                    State = ActivationStates.Activating
-                }).GetAwaiter().GetResult();
-                return _inner.TryScheduleGracefulRestart(reason);
+                    var current = _owner._store.LoadAsync().GetAwaiter().GetResult();
+                    if (current is not { State: ActivationStates.Pending })
+                        return false;
+                    _owner._store.UpdateAsync(current.Revision, record => record! with
+                    {
+                        State = ActivationStates.Activating
+                    }).GetAwaiter().GetResult();
+                    return true;
+                });
             }
             catch (Exception ex)
             {

@@ -86,6 +86,7 @@ public sealed class ActivationRecordStoreTests : IDisposable
         var verifying = await store.UpdateAsync(activating.Revision, record => record! with
         {
             State = ActivationStates.Verifying,
+            CurrentCheckpoint = record.PendingCheckpoint,
             VerificationTarget = "pending"
         });
 
@@ -93,6 +94,7 @@ public sealed class ActivationRecordStoreTests : IDisposable
         var updated = await store.UpdateAsync(verifying.Revision, record => record! with
         {
             PendingCheckpoint = finalized,
+            CurrentCheckpoint = finalized,
             Checks = new List<ActivationCheck>(record.Checks)
             {
                 Check("pending.generated-config", true)

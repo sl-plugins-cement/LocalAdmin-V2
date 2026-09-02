@@ -4,6 +4,7 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -66,25 +67,29 @@ internal sealed class ActivationHookRunner : IActivationHookRunner
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(TimeSpan.FromSeconds(Math.Max(30, record.Readiness.TimeoutSeconds)));
 
-        string stdout;
-        string stderr;
+        var stdoutTask = ReadBoundedAsync(process.StandardOutput, process, timeout.Token);
+        var stderrTask = ReadBoundedAsync(process.StandardError, process, timeout.Token);
         try
         {
-            var stdoutTask = process.StandardOutput.ReadToEndAsync(timeout.Token);
-            var stderrTask = process.StandardError.ReadToEndAsync(timeout.Token);
-            await process.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
-            stdout = await stdoutTask.ConfigureAwait(false);
-            stderr = await stderrTask.ConfigureAwait(false);
+            await Task.WhenAll(
+                process.WaitForExitAsync(timeout.Token),
+                stdoutTask,
+                stderrTask).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException)
         {
-            try { process.Kill(entireProcessTree: true); }
-            catch { /* best effort */ }
+            await KillAndWaitAsync(process).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
             throw new ActivationProtocolException($"scpsl-ops hook '{phase}' timed out.");
         }
+        catch
+        {
+            await KillAndWaitAsync(process).ConfigureAwait(false);
+            throw;
+        }
 
-        if (stdout.Length > MaximumOutputCharacters || stderr.Length > MaximumOutputCharacters)
-            throw new ActivationProtocolException($"scpsl-ops hook '{phase}' exceeded the output limit.");
+        var stdout = await stdoutTask.ConfigureAwait(false);
+        var stderr = await stderrTask.ConfigureAwait(false);
 
         if (process.ExitCode != 0)
             throw new ActivationProtocolException(
@@ -124,5 +129,54 @@ internal sealed class ActivationHookRunner : IActivationHookRunner
     {
         text = text.Trim();
         return text.Length <= 512 ? text : text[..512];
+    }
+
+    private static async Task<string> ReadBoundedAsync(
+        StreamReader reader,
+        Process process,
+        CancellationToken cancellationToken)
+    {
+        var result = new StringBuilder(Math.Min(4096, MaximumOutputCharacters));
+        var buffer = new char[4096];
+        while (true)
+        {
+            var read = await reader.ReadAsync(buffer.AsMemory(), cancellationToken).ConfigureAwait(false);
+            if (read == 0)
+                return result.ToString();
+            if (result.Length > MaximumOutputCharacters - read)
+            {
+                TryKill(process);
+                throw new ActivationProtocolException("scpsl-ops hook exceeded the output limit.");
+            }
+            result.Append(buffer, 0, read);
+        }
+    }
+
+    private static async Task KillAndWaitAsync(Process process)
+    {
+        TryKill(process);
+        try
+        {
+            if (!process.HasExited)
+                await process.WaitForExitAsync().ConfigureAwait(false);
+        }
+        catch
+        {
+            // The process may race its own exit or become unavailable after Kill. The kill request
+            // has still been issued; never mask the original hook failure with teardown noise.
+        }
+    }
+
+    private static void TryKill(Process process)
+    {
+        try
+        {
+            if (!process.HasExited)
+                process.Kill(entireProcessTree: true);
+        }
+        catch
+        {
+            // Best effort during cancellation/failure; KillAndWaitAsync preserves the root cause.
+        }
     }
 }

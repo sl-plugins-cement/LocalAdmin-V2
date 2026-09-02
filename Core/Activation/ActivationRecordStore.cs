@@ -198,11 +198,16 @@ internal sealed partial class ActivationRecordStore
             case ActivationStates.Verifying:
                 if (!openFieldsPresent || record.VerificationTarget != "pending" || record.RollbackAttempted)
                     Fail("verifying state has inconsistent fields.");
+                if (record.CurrentCheckpoint != record.PendingCheckpoint)
+                    Fail("verifying state must identify the installed pending checkpoint as current.");
                 break;
 
             case ActivationStates.RollingBack:
                 if (!openFieldsPresent || record.VerificationTarget != "previous" || !record.RollbackAttempted)
                     Fail("rolling-back state has inconsistent fields.");
+                if (record.CurrentCheckpoint != record.PendingCheckpoint &&
+                    record.CurrentCheckpoint != record.PreviousCheckpoint)
+                    Fail("rolling-back current checkpoint must be the candidate or restored previous checkpoint.");
                 break;
 
             case ActivationStates.RolledBack:
@@ -215,6 +220,9 @@ internal sealed partial class ActivationRecordStore
                 if (!openFieldsPresent || record.VerificationTarget != "previous" ||
                     !record.RollbackAttempted || string.IsNullOrWhiteSpace(record.LastError))
                     Fail("recovery-required state has inconsistent fields.");
+                if (record.CurrentCheckpoint != record.PendingCheckpoint &&
+                    record.CurrentCheckpoint != record.PreviousCheckpoint)
+                    Fail("recovery-required current checkpoint must retain the last durably known installed target.");
                 break;
         }
     }
@@ -244,18 +252,26 @@ internal sealed partial class ActivationRecordStore
 
         if (before.State == after.State)
         {
+            var finalizesPending = before.State == ActivationStates.Verifying &&
+                                   before.VerificationTarget == "pending" &&
+                                   after.CurrentCheckpoint == after.PendingCheckpoint;
+            var recordsRestoredRollback = before.State == ActivationStates.RollingBack &&
+                                          before.CurrentCheckpoint == before.PendingCheckpoint &&
+                                          after.CurrentCheckpoint == before.PreviousCheckpoint;
             var normalizedAfter = after with
             {
                 Revision = before.Revision,
                 UpdatedAt = before.UpdatedAt,
                 Checks = before.Checks,
-                PendingCheckpoint = before.State == ActivationStates.Verifying &&
-                                    before.VerificationTarget == "pending"
+                PendingCheckpoint = finalizesPending
                     ? before.PendingCheckpoint
-                    : after.PendingCheckpoint
+                    : after.PendingCheckpoint,
+                CurrentCheckpoint = finalizesPending || recordsRestoredRollback
+                    ? before.CurrentCheckpoint
+                    : after.CurrentCheckpoint
             };
             if (normalizedAfter != before)
-                Fail("A same-state revision may only append checks and, while verifying pending, finalize pending_checkpoint.");
+                Fail("A same-state revision may only append checks, finalize the pending manifest, or record an applied rollback.");
             return;
         }
 
@@ -275,6 +291,19 @@ internal sealed partial class ActivationRecordStore
 
         if (!allowed)
             Fail($"Illegal activation transition {before.State} -> {after.State}.");
+
+        if (before.State != ActivationStates.Verified &&
+            (before.PreparedAt != after.PreparedAt || before.Readiness != after.Readiness))
+            Fail("Captured activation identity and policy are immutable while an activation is open.");
+        if (before.State != ActivationStates.Verified && after.State != ActivationStates.Verified &&
+            (before.Lock != after.Lock || before.Restart != after.Restart ||
+             before.PreviousCheckpoint != after.PreviousCheckpoint))
+            Fail("The lane lock, restart policy, and rollback target are immutable while an activation is open.");
+
+        if (after.State == ActivationStates.Verifying && after.CurrentCheckpoint != after.PendingCheckpoint)
+            Fail("activating -> verifying must record the installed pending checkpoint as current.");
+        if (after.State == ActivationStates.RolledBack && after.CurrentCheckpoint != after.PreviousCheckpoint)
+            Fail("rolling-back -> rolled-back must retain the restored previous checkpoint as current.");
     }
 
     private async Task<ActivationRecord?> LoadUnlockedAsync(CancellationToken cancellationToken)

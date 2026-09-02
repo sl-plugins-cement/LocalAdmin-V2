@@ -1325,6 +1325,35 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost, IActivationHo
         return true;
     }
 
+    /// <summary>
+    /// Atomically reserves this session's lifecycle for a managed activation and commits the
+    /// durable pending -&gt; activating transition before asking the game to exit. Holding the
+    /// lifecycle lock across the record commit prevents an unrelated crash/shutdown from winning
+    /// between those two operations; if another exit already owns the session, the record remains
+    /// pending and can be re-armed later.
+    /// </summary>
+    public bool TryScheduleManagedActivationRestart(string reason, Func<bool> commitActivation)
+    {
+        lock (this)
+        {
+            if (_processClosing || _exit || DisableExitActionSignals)
+                return false;
+            try
+            {
+                if (_gameProcess is not { HasExited: false })
+                    return false;
+            }
+            catch
+            {
+                return false;
+            }
+            if (!commitActivation())
+                return false;
+
+            return RequestScheduledRestart(reason) && ExitAction == ShutdownAction.Restart;
+        }
+    }
+
     /// <summary>Re-arms a one-shot restart intent carried over from a previous in-process session.</summary>
     private void RearmPendingRestartIntent() => RestartIntents.RearmForNewSession(this, _playerTracker);
 
@@ -1491,7 +1520,7 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost, IActivationHo
     bool IActivationHost.GameConsoleConnected => Server is { Connected: true };
 
     bool IActivationHost.StartupHeartbeatReady =>
-        !EnableGameHeartbeat || CurrentHeartbeatStatus == HeartbeatStatus.Active;
+        EnableGameHeartbeat && CurrentHeartbeatStatus == HeartbeatStatus.Active;
 
     bool IActivationHost.IsGameUdpPortBound() => IsGameUdpPortBound();
 
