@@ -58,6 +58,16 @@ public sealed class ActivationHookRunnerTests : IDisposable
         }
     }
 
+    [Fact]
+    public async Task Failed_Preflight_Preserves_Json_Error_From_Nonzero_Exit()
+    {
+        var runner = new ActivationHookRunner(FixturePath());
+        var result = await runner.RunAsync("preflight", ActivationRecordStoreTests.Open(
+            ActivationRecordStoreTests.Verified(), ActivationStates.Prepared), CancellationToken.None);
+        Assert.False(result.Ok);
+        Assert.Equal("service account cannot read host.json", result.Error);
+    }
+
     private string FixturePath()
     {
         Environment.SetEnvironmentVariable("LOCALADMIN_HOOK_FIXTURE_PID_FILE", _pidFile);

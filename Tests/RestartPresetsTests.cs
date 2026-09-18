@@ -49,23 +49,10 @@ public sealed class RestartPresetsTests
     }
 
     [Fact]
-    public void Empty_Requires_Sustained_HalfHour()
+    public void Catalog_Contains_Only_Three_Clear_Choices()
     {
-        Assert.True(RestartPresets.TryGet("empty", out var preset));
-        var condition = Assert.IsType<RestartCondition>(preset.Condition);
-        Assert.Equal(RestartEdge.LowActivityTick, condition.Edge);
-        Assert.Equal(0, condition.MaxPlayers);
-        Assert.Equal(1800, condition.SustainedSeconds);
-    }
-
-    [Fact]
-    public void Low30m_Requires_Sustained_HalfHour()
-    {
-        Assert.True(RestartPresets.TryGet("low-30m", out var preset));
-        var condition = Assert.IsType<RestartCondition>(preset.Condition);
-        Assert.Equal(RestartEdge.LowActivityTick, condition.Edge);
-        Assert.Equal(1, condition.MaxPlayers);
-        Assert.Equal(1800, condition.SustainedSeconds);
+        Assert.Equal(new[] { "safe", "low-pop", "now" }, System.Linq.Enumerable.Select(RestartPresets.List, p => p.Name));
+        foreach (var name in new[] { "empty", "low-30m", "quiet-hour" }) Assert.False(RestartPresets.TryGet(name, out _));
     }
 
     [Fact]

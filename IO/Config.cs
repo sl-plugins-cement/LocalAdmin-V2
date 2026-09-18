@@ -47,6 +47,9 @@ public class Config
     // Managed activation is disabled until a lane is assigned. The CLI path must be absolute so
     // LocalAdmin never resolves a deployment hook through a mutable service PATH.
     public string OpsLane = string.Empty;
+    // DEV keeps its lane identity for typed restart receipts without enabling checkpoint activation.
+    public bool OpsManagedActivationEnabled = true;
+    internal bool UsesManagedActivation => OpsManagedActivationEnabled && !string.IsNullOrWhiteSpace(OpsLane);
     public string OpsStateRoot = OperatingSystem.IsWindows()
         ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "scpsl-ops")
         : "/var/lib/scpsl-ops";
@@ -136,6 +139,9 @@ public class Config
 
         sb.Append("ops_lane: ");
         sb.AppendLine(OpsLane);
+
+        sb.Append("ops_managed_activation_enabled: ");
+        sb.AppendLine(OpsManagedActivationEnabled.ToString().ToLowerInvariant());
 
         sb.Append("ops_state_root: ");
         sb.AppendLine(OpsStateRoot);
@@ -296,6 +302,10 @@ public class Config
                     cfg.OpsLane = sp[1].Trim();
                     break;
 
+                case "ops_managed_activation_enabled" when bool.TryParse(sp[1], out var enabled):
+                    cfg.OpsManagedActivationEnabled = enabled;
+                    break;
+
                 case "ops_state_root":
                     cfg.OpsStateRoot = sp[1].Trim();
                     break;
@@ -415,8 +425,8 @@ public class Config
             ? "- Server application path is not configured; LocalAdmin will auto-discover it."
             : $"- Server application path is configured as: {ServerApplicationPath}");
 
-        sb.AppendLine(string.IsNullOrWhiteSpace(OpsLane)
-            ? "- Managed activation is DISABLED (ops_lane is empty)."
+        sb.AppendLine(!UsesManagedActivation
+            ? $"- Managed activation is DISABLED; typed command lane: {OpsLane}."
             : $"- Managed activation lane: {OpsLane}; state root: {OpsStateRoot}; CLI: {OpsCliPath}");
 
         if (AutoRestartEmptyEnabled)

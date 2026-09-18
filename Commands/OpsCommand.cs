@@ -105,6 +105,12 @@ internal sealed partial class OpsCommand : CommandBase
                 message = "activation pending";
                 break;
 
+            case "replace-pending" when args.Length == 6:
+                record = _coordinator.ReplacePendingAsync(args[1], args[2], args[3], args[4],
+                    RequiredLong(args[5], "expected revision")).GetAwaiter().GetResult();
+                message = "pending activation replaced; existing next-round intent preserved";
+                break;
+
             case "cancel" when args.Length == 2:
                 record = _coordinator.CancelAsync(args[1]).GetAwaiter().GetResult();
                 message = record.State == ActivationStates.Verified
@@ -136,7 +142,7 @@ internal sealed partial class OpsCommand : CommandBase
 
             default:
                 throw new ActivationProtocolException(
-                    "Usage: ops <request-id> status|bootstrap|prepare|arm|cancel|recovery-adopt|probe");
+                    "Usage: ops <request-id> status|bootstrap|prepare|arm|replace-pending|cancel|recovery-adopt|probe");
         }
 
         return new OpsCommandResponse

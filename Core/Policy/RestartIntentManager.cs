@@ -326,6 +326,10 @@ internal sealed class RestartIntentManager
                     policy.Start(token);
                     break;
 
+                case RestartEdge.Immediate:
+                case RestartEdge.RoundEnd when intent.Condition.RestartIfEmpty:
+                    StartSafePoller(host, tracker, intent, token);
+                    break;
                 case RestartEdge.RoundEnd when intent.Condition.MaxPlayers.HasValue:
                     StartGatePoller(host, token);
                     break;
@@ -392,6 +396,43 @@ internal sealed class RestartIntentManager
     /// Keeps a fresh authoritative player count available while a player-gated round intent is
     /// armed, so the gate can be evaluated the moment the round-restart edge arrives.
     /// </summary>
+    internal bool EvaluateImmediateOrEmpty(IRestartHost host, PlayerCountTracker tracker, DateTime nowUtc)
+    {
+        lock (_lock)
+        {
+            if (_pending == null || _firing || host.IsShuttingDown || host.RestartInProgress) return false;
+            var condition = _pending.Condition;
+            if (condition.Edge != RestartEdge.Immediate &&
+                (!condition.RestartIfEmpty || !tracker.TryGetFreshCount(nowUtc, TimeSpan.FromSeconds(5), out var players) || players != 0)) return false;
+            _firing = true;
+        }
+        var scheduled = false;
+        try { scheduled = host.TryScheduleGracefulRestart("restart intent (immediate or confirmed empty)"); return scheduled; }
+        finally
+        {
+            lock (_lock) { _firing = false; if (scheduled) _pending = null; }
+        }
+    }
+
+    private void StartSafePoller(IRestartHost host, PlayerCountTracker tracker, PendingIntent intent, CancellationToken token)
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                // Let arming publish its readable intent before evaluating it.
+                while (true)
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(1), token).ConfigureAwait(false);
+                    lock (_lock) { if (!ReferenceEquals(_pending, intent)) return; }
+                    if (EvaluateImmediateOrEmpty(host, tracker, DateTime.UtcNow)) return;
+                    try { host.RequestPlayerCountRefresh(); } catch { /* retry next tick */ }
+                }
+            }
+            catch (OperationCanceledException) { }
+        }, token);
+    }
+
     private static void StartGatePoller(IRestartHost host, CancellationToken token)
     {
         _ = Task.Run(async () =>

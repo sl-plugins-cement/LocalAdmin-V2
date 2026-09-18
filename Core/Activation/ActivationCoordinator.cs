@@ -273,7 +273,38 @@ internal sealed class ActivationCoordinator
     internal async Task<ActivationRecord> ArmAsync(string activationId, CancellationToken cancellationToken = default)
     {
         var prepared = await RequireActivationAsync(activationId, ActivationStates.Prepared, cancellationToken).ConfigureAwait(false);
+        // Run with LocalAdmin's identity while the current game is still available. A failed
+        // preflight leaves the reservation cancellable and never schedules a shutdown.
+        var preflight = await RunHookSafeAsync("preflight", prepared, cancellationToken).ConfigureAwait(false);
+        if (!preflight.Ok)
+            throw new ActivationProtocolException($"Deployment preflight failed before restart: {preflight.Error}");
         return await _store.UpdateAsync(prepared.Revision, record => record! with { State = ActivationStates.Pending }, cancellationToken).ConfigureAwait(false);
+    }
+
+    internal async Task<ActivationRecord> ReplacePendingAsync(string previousActivationId,
+        string previousCheckpoint, string activationId, string pendingCheckpoint, long expectedRevision,
+        CancellationToken cancellationToken = default)
+    {
+        var current = await RequireActivationAsync(previousActivationId, ActivationStates.Pending, cancellationToken).ConfigureAwait(false);
+        if (current.Revision != expectedRevision || current.PendingCheckpoint != previousCheckpoint)
+            throw new ActivationProtocolException("The pending activation changed; prepare a fresh hotfix addition.");
+        if (current.Restart is not { Preset: "next-round", Edge: "round-end", Rounds: 1, MaxPlayers: null })
+            throw new ActivationProtocolException("Only an armed next-round activation accepts additions.");
+        if (!Guid.TryParseExact(activationId, "D", out var id) || id == Guid.Empty || activationId == previousActivationId)
+            throw new ActivationProtocolException("Replacement requires a fresh activation UUID.");
+        var candidate = current with
+        {
+            ProtocolVersion = 2,
+            ActivationId = activationId,
+            PendingCheckpoint = pendingCheckpoint,
+            Lock = current.Lock! with { Id = activationId }
+        };
+        var preflight = await RunHookSafeAsync("preflight-replacement", candidate, cancellationToken).ConfigureAwait(false);
+        if (!preflight.Ok)
+            throw new ActivationProtocolException($"Pending replacement preflight failed: {preflight.Error}");
+        // The store's compare-and-swap competes with the round-edge transition. The existing
+        // restart manager keeps its counters and reads the winning record when it fires.
+        return await _store.UpdateAsync(current.Revision, _ => candidate, cancellationToken).ConfigureAwait(false);
     }
 
     internal async Task<ActivationRecord> CancelAsync(string activationId, CancellationToken cancellationToken = default)
@@ -318,7 +349,12 @@ internal sealed class ActivationCoordinator
             PathManager.ConfigPath,
             CustomRestartPresets.DirectoryName);
         RestartCondition condition;
-        if (RestartPresets.TryResolve(restart.Preset, customPresetDirectory, out var preset, out var presetError))
+        if (restart.Preset == "empty" && restart.Edge == "empty")
+        {
+            condition = new RestartCondition { Edge = RestartEdge.LowActivityTick, MaxPlayers = 0,
+                Confirmations = 1, TickSeconds = 1 };
+        }
+        else if (RestartPresets.TryResolve(restart.Preset, customPresetDirectory, out var preset, out var presetError))
         {
             condition = preset.Condition;
         }
@@ -333,6 +369,7 @@ internal sealed class ActivationCoordinator
             condition = new RestartCondition
             {
                 Edge = condition.Edge,
+                RestartIfEmpty = condition.RestartIfEmpty,
                 MaxPlayers = condition.MaxPlayers,
                 SustainedSeconds = condition.SustainedSeconds,
                 Confirmations = condition.Confirmations,
@@ -354,6 +391,7 @@ internal sealed class ActivationCoordinator
             condition = new RestartCondition
             {
                 Edge = condition.Edge,
+                RestartIfEmpty = condition.RestartIfEmpty,
                 MaxPlayers = restart.MaxPlayers,
                 SustainedSeconds = condition.SustainedSeconds,
                 Confirmations = condition.Confirmations,

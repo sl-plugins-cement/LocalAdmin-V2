@@ -27,55 +27,24 @@ internal static class RestartPresets
     // Ordered so "restartwhen list" prints a stable, curated catalog.
     private static readonly Preset[] All =
     {
-        new("next-round",
-            "Restart after the current round through the cancellable LocalAdmin intent.",
-            new RestartCondition { Edge = RestartEdge.RoundEnd }),
-
-        new("next-round-lowpop",
-            "Restart on the next round restart that ends with fewer than 5 players; otherwise wait for a later round.",
-            new RestartCondition { Edge = RestartEdge.RoundEnd, MaxPlayers = 4 }),
-
-        new("empty",
-            "Restart once the server has been empty for 30 sustained minutes.",
-            new RestartCondition
-            {
-                Edge = RestartEdge.LowActivityTick,
-                MaxPlayers = 0,
-                SustainedSeconds = 1800,
-                Confirmations = 2,
-                TickSeconds = 30
-            }),
-
-        new("low-30m",
-            "Restart once fewer than 2 players have been on for 30 sustained minutes.",
-            new RestartCondition
-            {
-                Edge = RestartEdge.LowActivityTick,
-                MaxPlayers = 1,
-                SustainedSeconds = 1800,
-                Confirmations = 2,
-                TickSeconds = 30
-            }),
-
-        new("quiet-hour",
-            "Restart once fewer than 2 players have been on for 30 sustained minutes AND the last hour never peaked above 4 players.",
-            new RestartCondition
-            {
-                Edge = RestartEdge.LowActivityTick,
-                MaxPlayers = 1,
-                SustainedSeconds = 1800,
-                Confirmations = 2,
-                TickSeconds = 30,
-                ActivityWindowMinutes = 60,
-                ActivityOverPlayers = 4
-            }),
+        new("safe", "Restart as soon as confirmed empty; otherwise at the next round end.",
+            new RestartCondition { Edge = RestartEdge.RoundEnd, RestartIfEmpty = true }),
+        new("low-pop", "Restart as soon as confirmed empty; otherwise at a round end with fewer than 5 players.",
+            new RestartCondition { Edge = RestartEdge.RoundEnd, MaxPlayers = 4, RestartIfEmpty = true }),
+        new("now", "Restart immediately, including when players are connected.",
+            new RestartCondition { Edge = RestartEdge.Immediate }),
     };
 
     internal static IReadOnlyList<Preset> List => All;
 
     internal static bool TryGet(string name, out Preset preset)
     {
+        // Compatibility for existing CLI deployment records; not separate menu choices.
+        var requestedName = name.ToLowerInvariant();
+        name = requestedName switch { "next-round" => "safe", "next-round-lowpop" => "low-pop", _ => name };
         preset = All.FirstOrDefault(p => string.Equals(p.Name, name, StringComparison.OrdinalIgnoreCase))!;
+        if (preset != null && (requestedName == "next-round" || requestedName == "next-round-lowpop"))
+            preset = preset with { Name = requestedName };
         return preset != null;
     }
 

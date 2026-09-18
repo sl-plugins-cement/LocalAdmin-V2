@@ -28,7 +28,7 @@ internal sealed class ActivationProtocolException : Exception
 /// </summary>
 internal sealed partial class ActivationRecordStore
 {
-    private const int ProtocolVersion = 1;
+    private const int MaximumProtocolVersion = 2;
     private static readonly TimeSpan LockTimeout = TimeSpan.FromSeconds(5);
     private readonly SemaphoreSlim _processLock = new(1, 1);
 
@@ -97,7 +97,6 @@ internal sealed partial class ActivationRecordStore
 
             var candidate = update(current) with
             {
-                ProtocolVersion = ProtocolVersion,
                 Revision = checked(actualRevision + 1),
                 Lane = Lane,
                 UpdatedAt = FormatTimestamp(DateTime.UtcNow)
@@ -121,7 +120,7 @@ internal sealed partial class ActivationRecordStore
 
     internal static void Validate(ActivationRecord record, string expectedLane)
     {
-        if (record.ProtocolVersion != ProtocolVersion)
+        if (record.ProtocolVersion is < 1 or > MaximumProtocolVersion)
             Fail($"Unsupported protocol_version {record.ProtocolVersion}.");
         if (record.Revision < 0)
             Fail("revision must be nonnegative.");
@@ -229,6 +228,22 @@ internal sealed partial class ActivationRecordStore
 
     private static void ValidateTransition(ActivationRecord before, ActivationRecord after)
     {
+        if (before.State == ActivationStates.Pending && after.State == ActivationStates.Pending &&
+            after.ProtocolVersion == 2 && before.ActivationId != after.ActivationId &&
+            before.PendingCheckpoint != after.PendingCheckpoint &&
+            before.Restart is { Preset: "next-round", Edge: "round-end", Rounds: 1, MaxPlayers: null })
+        {
+            var normalized = after with { ProtocolVersion = before.ProtocolVersion,
+                Revision = before.Revision, UpdatedAt = before.UpdatedAt, ActivationId = before.ActivationId,
+                PendingCheckpoint = before.PendingCheckpoint, Lock = before.Lock, Checks = before.Checks };
+            if (normalized != before || after.Lock != (before.Lock! with { Id = after.ActivationId }) ||
+                !before.Checks.SequenceEqual(after.Checks))
+                Fail("Pending replacement must preserve the restart, rollback, lock ownership, and readiness policy.");
+            return;
+        }
+        if (before.ProtocolVersion != after.ProtocolVersion)
+            Fail("Only atomic pending replacement may upgrade activation protocol version.");
+
         if (!string.Equals(before.ActivationId, after.ActivationId, StringComparison.Ordinal) &&
             before.State != ActivationStates.Verified)
             Fail("activation_id cannot change while an activation is open.");

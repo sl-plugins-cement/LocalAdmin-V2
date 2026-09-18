@@ -1299,8 +1299,9 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost, IActivationHo
     }
 
     /// <summary>
-    /// Claims a graceful restart and, when committed, arms a background force-fallback so a stalled
-    /// game-side exit is still forced after ~60s. The fallback is bound to THIS session via the
+    /// Claims a native game restart and, when committed, arms a background force-fallback so a stalled
+    /// <c>rnr</c> then <c>restart</c> sequence is still forced after ~60s. The fallback is bound to
+    /// THIS session via the
     /// instance <see cref="_processClosing"/> flag - a fresh session gets a fresh instance - so it
     /// can never act on a later session. Returns true iff a Restart was actually claimed.
     /// </summary>
@@ -1315,9 +1316,9 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost, IActivationHo
             {
                 await Task.Delay(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
 
-                // If this session hasn't started tearing down, the graceful exit stalled - force it.
+                // If this session hasn't started tearing down, the native restart stalled - force it.
                 if (!_processClosing)
-                    ForceScheduledRestart($"{reason}; graceful exit stalled");
+                    ForceScheduledRestart($"{reason}; native restart stalled");
             }
             catch { /* fallback is best-effort; never surface */ }
         });
@@ -1374,7 +1375,7 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost, IActivationHo
     }
 
     /// <summary>
-    /// Performs or retries a graceful restart (the RestartCommand pattern) for an automated trigger.
+    /// Performs or retries a native game restart (<c>rnr</c> followed by <c>restart</c>) for an automated trigger.
     /// The storm-guard bypass (<see cref="_ignoreNextRestart"/>) is NOT armed here: Exit()
     /// already sets it atomically under its lifecycle lock at the moment it commits to a
     /// ShutdownAction.Restart, so arming early would let an interleaving crash/shutdown
@@ -1415,13 +1416,15 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost, IActivationHo
             var server = Server;
             if (server is { Connected: true })
             {
-                if (server.WriteLine("exit"))
+                if (TrySendNativeRestartCommands(server.WriteLine))
                     return true;
 
-                ConsoleUtil.WriteLine("Scheduled restart could not send graceful exit command; falling back to LocalAdmin-controlled restart.", ConsoleColor.Yellow);
+                ConsoleUtil.WriteLine(
+                    "Scheduled restart could not send the native rnr/restart command sequence; falling back to LocalAdmin-controlled restart.",
+                    ConsoleColor.Yellow);
             }
 
-            // No live game connection, or the graceful command could not be sent: unblock
+            // No live game connection, or the native command sequence could not be sent: unblock
             // the main loop; the ExitAction.Restart path will terminate the game and relaunch.
             _exit = true;
             return true;
@@ -1429,7 +1432,17 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost, IActivationHo
     }
 
     /// <summary>
-    /// Forces a scheduled restart after the graceful game-side exit command failed to
+    /// Sends SCP:SL's native full-restart sequence in strict order. If <c>rnr</c> cannot be sent,
+    /// <c>restart</c> is not sent because it would only restart the current round.
+    /// </summary>
+    internal static bool TrySendNativeRestartCommands(Func<string, bool> sendCommand)
+    {
+        ArgumentNullException.ThrowIfNull(sendCommand);
+        return sendCommand("rnr") && sendCommand("restart");
+    }
+
+    /// <summary>
+    /// Forces a scheduled restart after the native game restart failed to
     /// complete. This keeps the same restart-storm guard bypass semantics as
     /// <see cref="RequestScheduledRestart"/>.
     /// </summary>
@@ -1544,7 +1557,7 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost, IActivationHo
     {
         _activation = null;
         _activationInitializationError = null;
-        if (Configuration == null || string.IsNullOrWhiteSpace(Configuration.OpsLane))
+        if (Configuration == null || !Configuration.UsesManagedActivation)
             return;
 
         try

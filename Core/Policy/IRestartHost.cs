@@ -12,7 +12,7 @@ namespace LocalAdmin.V2.Core.Policy;
 internal interface IRestartHost
 {
     /// <summary>
-    /// Claims a graceful restart with a background force fallback (a stalled game-side exit is
+    /// Claims a native <c>rnr</c> then <c>restart</c> sequence with a background force fallback (a stalled restart is
     /// forced after ~60s). Returns true iff a Restart was actually claimed as the shutdown
     /// action; false means another shutdown action already owns the exit.
     /// </summary>

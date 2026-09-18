@@ -24,7 +24,7 @@ public sealed class ActivationCoordinatorTests : IDisposable
         Assert.True(resume.LaunchGame);
         Assert.Equal(ActivationStates.Verifying, resume.Record!.State);
         Assert.Equal(Pending, resume.Record.CurrentCheckpoint);
-        Assert.Equal(new[] { "apply-target" }, setup.Hooks.Phases);
+        Assert.Equal(new[] { "preflight", "apply-target" }, setup.Hooks.Phases);
     }
 
     [Fact]
@@ -234,7 +234,8 @@ public sealed class ActivationCoordinatorTests : IDisposable
 
     private async Task<Setup> SetupActivatingAsync(
         bool stopAtPending = false,
-        ActivationReadiness? readiness = null)
+        ActivationReadiness? readiness = null,
+        bool stopAtPrepared = false, ActivationRestart? restart = null)
     {
         var store = new ActivationRecordStore(_root, "example/prod");
         var host = new FakeHost();
@@ -250,7 +251,7 @@ public sealed class ActivationCoordinatorTests : IDisposable
             bootstrap.Revision,
             Pending,
             "test",
-            new ActivationRestart
+            restart ?? new ActivationRestart
             {
                 Preset = "immediate",
                 Edge = "immediate",
@@ -258,6 +259,8 @@ public sealed class ActivationCoordinatorTests : IDisposable
                 Rounds = null
             },
             readiness ?? ActivationRecordStoreTests.Readiness());
+        if (stopAtPrepared)
+            return new(store, coordinator, hooks, host, tracker);
         var pending = await coordinator.ArmAsync(prepared.ActivationId);
         if (!stopAtPending)
         {
@@ -278,6 +281,103 @@ public sealed class ActivationCoordinatorTests : IDisposable
         throw new TimeoutException($"Activation record did not enter {state}.");
     }
 
+    [Fact]
+    public async Task Failed_Preflight_Leaves_Game_Running_And_Reservation_Cancellable()
+    {
+        var setup = await SetupActivatingAsync(stopAtPrepared: true);
+        setup.Hooks.FailPreflight = true;
+        var before = (await setup.Store.LoadAsync())!;
+        var error = await Assert.ThrowsAsync<ActivationProtocolException>(() =>
+            setup.Coordinator.ArmAsync(before.ActivationId));
+        Assert.Contains("preflight failed before restart", error.Message);
+        var after = (await setup.Store.LoadAsync())!;
+        Assert.Equal(ActivationStates.Prepared, after.State);
+        Assert.Equal(before.Revision, after.Revision);
+        Assert.Equal(0, setup.Host.ForcedRestarts);
+        Assert.False(setup.Host.ManagedRestartCommitInvoked);
+        Assert.Equal(ActivationStates.Verified,
+            (await setup.Coordinator.CancelAsync(before.ActivationId)).State);
+    }
+
+    [Fact]
+    public async Task Pending_Replacement_Preserves_Intent_And_Next_Round_Activates_New_Batch()
+    {
+        var setup = await SetupNextRoundAsync();
+        var before = (await setup.Store.LoadAsync())!;
+        await setup.Coordinator.OnChildStartedAsync();
+        var nextId = Guid.NewGuid().ToString("D");
+        var nextCheckpoint = new string('c', 64);
+        var after = await setup.Coordinator.ReplacePendingAsync(before.ActivationId, Pending,
+            nextId, nextCheckpoint, before.Revision);
+        Assert.Equal(before.Revision + 1, after.Revision);
+        Assert.Equal(ActivationStates.Pending, after.State);
+        Assert.Equal(before.Restart, after.Restart);
+        Assert.Equal(before.PreparedAt, after.PreparedAt);
+        Assert.Equal(before.Lock!.AcquiredAt, after.Lock!.AcquiredAt);
+        Assert.Equal(Current, after.PreviousCheckpoint);
+        Assert.Equal(Current, after.CurrentCheckpoint);
+        Assert.False(setup.Host.ManagedRestartCommitInvoked);
+        setup.Coordinator.NotifyRoundRestart();
+        var activated = (await setup.Store.LoadAsync())!;
+        Assert.Equal(ActivationStates.Activating, activated.State);
+        Assert.Equal(nextId, activated.ActivationId);
+        Assert.Equal(nextCheckpoint, activated.PendingCheckpoint);
+        setup.Coordinator.StopForSessionEnd();
+    }
+
+    [Fact]
+    public async Task Replacement_Preflight_Failure_Leaves_Original_Queue_Armed()
+    {
+        var setup = await SetupNextRoundAsync();
+        var before = (await setup.Store.LoadAsync())!;
+        setup.Hooks.FailPreflight = true;
+        await Assert.ThrowsAsync<ActivationProtocolException>(() => setup.Coordinator.ReplacePendingAsync(
+            before.ActivationId, Pending, Guid.NewGuid().ToString("D"), new string('c', 64), before.Revision));
+        var after = (await setup.Store.LoadAsync())!;
+        Assert.Equal(before.Revision, after.Revision);
+        Assert.Equal(before.ActivationId, after.ActivationId);
+        Assert.Equal(ActivationStates.Pending, after.State);
+        Assert.Equal(Pending, after.PendingCheckpoint);
+        Assert.Equal(before.Restart, after.Restart);
+    }
+
+    [Theory]
+    [InlineData("revision")]
+    [InlineData("checkpoint")]
+    [InlineData("activation")]
+    [InlineData("edge")]
+    public async Task Replacement_Rejects_Stale_Identity_And_Unsupported_Edge(string mismatch)
+    {
+        var setup = mismatch == "edge" ? await SetupActivatingAsync(stopAtPending: true) : await SetupNextRoundAsync();
+        var before = (await setup.Store.LoadAsync())!;
+        await Assert.ThrowsAsync<ActivationProtocolException>(() => setup.Coordinator.ReplacePendingAsync(
+            mismatch == "activation" ? Guid.NewGuid().ToString("D") : before.ActivationId,
+            mismatch == "checkpoint" ? Current : Pending,
+            Guid.NewGuid().ToString("D"), new string('c', 64),
+            mismatch == "revision" ? before.Revision - 1 : before.Revision));
+        Assert.Equal(before.Revision, (await setup.Store.LoadAsync())!.Revision);
+    }
+
+    [Fact]
+    public async Task Round_Edge_During_Replacement_Preflight_Wins_Without_Losing_Old_Plan()
+    {
+        var setup = await SetupNextRoundAsync();
+        var before = (await setup.Store.LoadAsync())!;
+        setup.Hooks.BeforeReplacement = async () =>
+        {
+            await setup.Store.UpdateAsync(before.Revision, r => r! with { State = ActivationStates.Activating });
+        };
+        await Assert.ThrowsAsync<ActivationProtocolException>(() => setup.Coordinator.ReplacePendingAsync(
+            before.ActivationId, Pending, Guid.NewGuid().ToString("D"), new string('c', 64), before.Revision));
+        var after = (await setup.Store.LoadAsync())!;
+        Assert.Equal(ActivationStates.Activating, after.State);
+        Assert.Equal(before.ActivationId, after.ActivationId);
+        Assert.Equal(Pending, after.PendingCheckpoint);
+    }
+
+    private Task<Setup> SetupNextRoundAsync() => SetupActivatingAsync(stopAtPending: true,
+        restart: new ActivationRestart { Preset = "next-round", Edge = "round-end", Rounds = 1, MaxPlayers = null });
+
     private sealed record Setup(
         ActivationRecordStore Store,
         ActivationCoordinator Coordinator,
@@ -288,11 +388,13 @@ public sealed class ActivationCoordinatorTests : IDisposable
     private sealed class FakeHooks : IActivationHookRunner
     {
         internal readonly List<string> Phases = new();
+        internal Func<Task>? BeforeReplacement;
         internal bool VerifyPendingOk = true;
         internal bool VerifyPreviousOk = true;
         internal bool NullCheckpointOnFailure;
         internal bool IncludeVerificationProof = true;
         internal bool FailRollbackApply;
+        internal bool FailPreflight;
         internal TimeSpan VerificationDelay;
 
         public async Task<ActivationHookResult> RunAsync(string phase, ActivationRecord record, CancellationToken cancellationToken)
@@ -301,9 +403,11 @@ public sealed class ActivationCoordinatorTests : IDisposable
                 Phases.Add(phase);
             if (phase == "verify-runtime" && VerificationDelay > TimeSpan.Zero)
                 await Task.Delay(VerificationDelay, cancellationToken);
+            if (phase == "preflight-replacement" && BeforeReplacement is not null) await BeforeReplacement();
             var isPrevious = record.VerificationTarget == "previous" || phase == "apply-rollback";
             var ok = phase switch
             {
+                "preflight" or "preflight-replacement" => !FailPreflight,
                 "apply-rollback" => !FailRollbackApply,
                 "verify-runtime" => isPrevious ? VerifyPreviousOk : VerifyPendingOk,
                 _ => true

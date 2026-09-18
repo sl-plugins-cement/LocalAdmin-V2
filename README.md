@@ -10,6 +10,22 @@ Linux: `./LocalAdmin [port] [arguments] [-- arguments passthrough]`
 
 # Enhanced fork features
 
+Managed activation runs the matching `scpsl-ops` `preflight` hook as the LocalAdmin
+service account before arming a restart. Configuration, storage access, and startup-log
+failures leave the running game alone and the prepared reservation cancellable. Upgrade
+the CLI before this fork; an older CLI without the hook rejects activation safely.
+
+For disposable DEV lanes, keep `ops_lane` for typed command identity and set
+`ops_managed_activation_enabled: false`. LocalAdmin then starts the installed game without
+checkpoint bootstrap, activation hooks, or managed rollback. The default is `true`, preserving
+managed production/mirror behavior. `scpsl-ops dev stage` directly replaces installed files;
+`dev activate` only requests a restart. A crash or another restart can load the new files too.
+
+DEV 可保留 `ops_lane` 并设置 `ops_managed_activation_enabled: false`，直接启动已安装文件，
+不要求检查点、激活 hook 或托管回滚。正式服与镜像保留默认值 `true`。
+启动部署前会使用 LocalAdmin 服务账户执行预检；预检失败不会停止游戏。请先更新配套
+`scpsl-ops`，再更新 LocalAdmin。
+
 This fork keeps the upstream LocalAdmin command flow and adds operational features for detached/headless SCP:SL servers.
 
 ## Server application path
@@ -99,7 +115,7 @@ Each tick the watchdog asks the server for an **authoritative** player count (it
 - the rolling `recent_activity_window_minutes` history is fully observed
 - that recent window never peaked above `recent_activity_over_players`
 
-Set `recent_activity_window_minutes` to `0` to disable the recent-activity guard. Restarts are scheduled through the normal graceful game-side `exit` path and fall back to a LocalAdmin-controlled restart if graceful exit stalls. A built-in cooldown prevents an always-empty server from restart-looping tightly.
+Set `recent_activity_window_minutes` to `0` to disable the recent-activity guard. Restarts are scheduled through SCP:SL's native `rnr` followed by native `restart` command sequence and fall back to a LocalAdmin-controlled restart if the native restart stalls. The watchdog never sends `exit`. A built-in cooldown prevents an always-empty server from restart-looping tightly.
 
 ## One-shot restart intents (`restartwhen`)
 
@@ -112,21 +128,17 @@ restartwhen status
 restartwhen cancel
 ```
 
-Presets (see `restartwhen list` for the live catalog):
+Presets (`restartwhen list` shows the live catalog):
 
-| Preset             | Fires |
-| ------------------ | ----- |
-| `next-round`       | Passes SCP:SL's native `rnr` command through to the game. |
-| `next-round-lowpop`| On the next round restart that ends with fewer than 5 players; otherwise waits for a later round. |
-| `empty`            | Once the server has been empty for 30 sustained minutes. |
-| `low-30m`          | Once fewer than 2 players have been on for 30 sustained minutes. |
-| `quiet-hour`       | As `low-30m`, and additionally the last hour never peaked above 4 players. |
+| Name | Behavior |
+|---|---|
+| `safe` | Restart as soon as a fresh count confirms zero players; otherwise at the next round end. |
+| `low-pop` | Restart as soon as confirmed empty; otherwise at a round end with fewer than 5 players. |
+| `now` | Restart immediately, even with players connected. |
 
-Conditions combine one **edge** (the event that evaluates the intent: a round restart, or a low-activity watchdog tick) with optional **gates** (state checks at that moment, e.g. a fresh player count at or below a threshold). A player-gated round preset only acts on a fresh authoritative player count; if none is available at the round edge, it skips that round rather than restart on stale data.
+Safe presets poll once per second and never infer an empty server from missing or stale player data. Each request fires once and is cancellable until committed. `next-round` and `next-round-lowpop` remain compatibility aliases for existing callers; the old 30-minute presets are removed from the catalog. Managed deployment `-rnr` uses the safe behavior. Native game `rnr` remains game-owned and still waits for a round; use `restartwhen safe` for an empty-server fallback.
 
-`next-round` is intentionally the exception to LocalAdmin-managed intents: arming it only forwards
-the native `rnr` command. SCP:SL owns that pending restart, so `restartwhen status` and
-`restartwhen cancel` do not report or alter it. LocalAdmin does not keep duplicate next-round state.
+中文：`safe` 在确认空服后立即重启，否则等待回合结束；`low-pop` 在空服时立即重启，否则等待人数少于 5 的回合结束；`now` 无论人数立即重启。只执行一次，不开启循环重启；未知或过期人数不会被当作空服。游戏原生 `rnr` 仍由游戏管理，空服回退请用 `restartwhen safe`。
 
 ### Custom presets (JSON files)
 

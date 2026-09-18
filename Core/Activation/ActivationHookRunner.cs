@@ -38,7 +38,7 @@ internal sealed class ActivationHookRunner : IActivationHookRunner
         ActivationRecord record,
         CancellationToken cancellationToken)
     {
-        if (phase is not ("apply-target" or "apply-rollback" or "verify-runtime" or "cleanup"))
+        if (phase is not ("preflight" or "preflight-replacement" or "apply-target" or "apply-rollback" or "verify-runtime" or "cleanup"))
             throw new ArgumentOutOfRangeException(nameof(phase));
 
         var startInfo = new ProcessStartInfo
@@ -91,10 +91,6 @@ internal sealed class ActivationHookRunner : IActivationHookRunner
         var stdout = await stdoutTask.ConfigureAwait(false);
         var stderr = await stderrTask.ConfigureAwait(false);
 
-        if (process.ExitCode != 0)
-            throw new ActivationProtocolException(
-                $"scpsl-ops hook '{phase}' exited {process.ExitCode}: {Bound(stderr)}");
-
         ActivationHookResult result;
         try
         {
@@ -103,8 +99,11 @@ internal sealed class ActivationHookRunner : IActivationHookRunner
         }
         catch (Exception ex)
         {
-            throw new ActivationProtocolException($"scpsl-ops hook '{phase}' returned invalid JSON: {ex.Message}", ex);
+            throw new ActivationProtocolException($"scpsl-ops hook '{phase}' exited {process.ExitCode} with invalid JSON: {ex.Message} {Bound(stderr)}", ex);
         }
+
+        if (process.ExitCode != 0 && result.Ok)
+            throw new ActivationProtocolException($"scpsl-ops hook '{phase}' claimed success but exited {process.ExitCode}.");
 
         if (result.ProtocolVersion != 1 || result.ActivationId != record.ActivationId || result.Phase != phase)
             throw new ActivationProtocolException($"scpsl-ops hook '{phase}' response identity does not match the request.");

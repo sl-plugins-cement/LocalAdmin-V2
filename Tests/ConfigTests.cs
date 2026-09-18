@@ -6,6 +6,18 @@ namespace LocalAdmin.V2.Tests;
 public sealed class ConfigTests
 {
     [Fact]
+    public void Dev_Keeps_Typed_Lane_Identity_Without_Managed_Activation()
+    {
+        var cfg = Config.DeserializeConfig(new[] { "ops_lane: oa/dev", "ops_managed_activation_enabled: false" });
+        Assert.False(cfg.UsesManagedActivation);
+        var roundtrip = Config.DeserializeConfig(cfg.SerializeConfig().Split('\n'));
+        Assert.False(roundtrip.UsesManagedActivation);
+        Assert.Equal("oa/dev", roundtrip.OpsLane);
+        Assert.True(Config.DeserializeConfig(new[] { "ops_lane: oa/prod" }).UsesManagedActivation);
+        Assert.True(Config.DeserializeConfig(new[] { "ops_lane: oa/prod", "ops_managed_activation_enabled: invalid" }).UsesManagedActivation);
+    }
+
+    [Fact]
     public void Roundtrips_Serialize_Then_Deserialize()
     {
         var cfg = new Config

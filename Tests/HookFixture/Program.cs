@@ -8,7 +8,14 @@ if (!string.IsNullOrWhiteSpace(pidFile))
     await File.WriteAllTextAsync(pidFile, Environment.ProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture));
 
 var phase = args.Length > 2 ? args[2] : string.Empty;
-if (phase == "apply-target")
+if (phase == "preflight")
+{
+    var activationId = args[Array.IndexOf(args, "--activation-id") + 1];
+    Console.WriteLine("{\"protocol_version\":1,\"ok\":false,\"activation_id\":\"" + activationId +
+        "\",\"phase\":\"preflight\",\"checkpoint\":null,\"checks\":[],\"error\":\"service account cannot read host.json\"}");
+    return 1;
+}
+else if (phase == "apply-target")
 {
     await Task.Delay(Timeout.InfiniteTimeSpan);
 }

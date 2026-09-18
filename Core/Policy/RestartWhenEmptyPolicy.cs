@@ -17,7 +17,7 @@ namespace LocalAdmin.V2.Core.Policy;
 /// Restart decisions act ONLY on a FRESH authoritative player count (the server's reply to the
 /// <c>players</c> command, which this watchdog polls each tick, or the game's IdleEnter byte); a
 /// stale or unknown count never triggers a restart. The restart itself is delegated to
-/// <see cref="IRestartHost.TryScheduleGracefulRestart"/>, which owns the graceful-exit force
+/// <see cref="IRestartHost.TryScheduleGracefulRestart"/>, which owns the native-restart force
 /// fallback; an independent cross-session cooldown (<see cref="s_lastAutoRestartUtc"/>) caps how
 /// often the watchdog can restart, so an always-empty server cannot restart-loop tightly.
 /// </summary>
@@ -179,7 +179,7 @@ internal sealed class RestartWhenEmptyPolicy
     private void CommitRestart(DateTime nowUtc, CancellationToken token)
     {
         ConsoleUtil.WriteLine(
-            $"{_options.Label} threshold reached; scheduling a graceful server restart (force fallback applies if the graceful exit stalls).",
+            $"{_options.Label} threshold reached; scheduling native rnr then restart (force fallback applies if the native restart stalls).",
             ConsoleColor.Cyan);
 
         if (_host.TryScheduleGracefulRestart(_options.RestartReason))

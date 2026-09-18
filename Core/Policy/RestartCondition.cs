@@ -12,6 +12,7 @@ internal enum RestartEdge : byte
 {
     /// <summary>A real round restart (the boot-time initial round is never counted).</summary>
     RoundEnd,
+    Immediate,
 
     /// <summary>The low-activity watchdog's periodic tick.</summary>
     LowActivityTick
@@ -30,6 +31,8 @@ internal sealed record RestartCondition
     internal required RestartEdge Edge { get; init; }
 
     /// <summary>For <see cref="RestartEdge.RoundEnd"/>: fire on the Nth qualifying round restart.</summary>
+    internal bool RestartIfEmpty { get; init; }
+
     internal int Rounds { get; init; } = 1;
 
     /// <summary>Gate: fresh player count must be at or below this to fire. Null = no player gate.</summary>
@@ -60,6 +63,8 @@ internal sealed record RestartCondition
     {
         var sb = new StringBuilder();
 
+        if (Edge == RestartEdge.Immediate) return "immediately (including with players connected)";
+        if (RestartIfEmpty) sb.Append("as soon as confirmed empty, otherwise ");
         if (Edge == RestartEdge.RoundEnd)
         {
             sb.Append(Rounds <= 1 ? "on the next round restart" : $"after {Rounds} round restarts");
