@@ -21,6 +21,17 @@ internal interface IActivationHost : IRestartHost
     Task<PlayerProbeResult> ProbePlayersAsync(TimeSpan timeout, CancellationToken cancellationToken);
     bool TryScheduleManagedActivationRestart(string reason, Func<bool> commitActivation);
     void ForceActivationSessionRestart(string reason);
+
+    /// <summary>
+    /// Arms the game's native "restart next round" flag unless it is already armed (rnr is a
+    /// toggle). Returns true when the flag is armed after the call.
+    /// </summary>
+    bool EnsureNativeRestartNextRoundArmed();
+
+    /// <summary>Disarms the native flag only when LocalAdmin armed it. Returns true when a disarm was sent.</summary>
+    bool DisarmNativeRestartNextRoundIfOwned();
+
+    string DescribeNativeRestartNextRound();
 }
 
 internal sealed record ActivationResumeResult(bool LaunchGame, string Message, ActivationRecord? Record);
@@ -315,11 +326,68 @@ internal sealed class ActivationCoordinator
             throw new ActivationProtocolException("Only the matching prepared or pending activation can be cancelled.");
 
         var cancelled = await _store.UpdateAsync(current.Revision, record => record! with { State = ActivationStates.Cancelled }, cancellationToken).ConfigureAwait(false);
-        _restartIntents.StopForSessionEnd();
+        ReleaseRestartEdge();
         var result = await RunHookSafeAsync("cleanup", cancelled, cancellationToken).ConfigureAwait(false);
         if (!result.Ok)
             return cancelled;
         return await _store.UpdateAsync(cancelled.Revision, record => ClearOpenActivation(record!, record!.CurrentCheckpoint!), cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Moves a pending activation to another restart edge without re-staging anything: the staged
+    /// checkpoint, lock and provenance stay; only the restart intent changes. <c>immediate</c>
+    /// fires the native rnr+restart sequence right away; <c>round-end</c> arms the native
+    /// restart-next-round flag. The record is updated before anything fires, so a LocalAdmin
+    /// restart in between resumes with the new edge.
+    /// </summary>
+    internal async Task<ActivationRecord> RescheduleAsync(
+        string activationId,
+        long expectedRevision,
+        string edge,
+        CancellationToken cancellationToken = default)
+    {
+        var current = await RequireActivationAsync(activationId, ActivationStates.Pending, cancellationToken).ConfigureAwait(false);
+        if (current.Revision != expectedRevision)
+            throw new ActivationProtocolException($"Expected revision {expectedRevision}, found {current.Revision}.");
+        var restart = edge switch
+        {
+            "immediate" => new ActivationRestart { Preset = "immediate", Edge = "immediate", MaxPlayers = null, Rounds = null },
+            "round-end" => new ActivationRestart { Preset = "next-round", Edge = "round-end", MaxPlayers = null, Rounds = 1 },
+            _ => throw new ActivationProtocolException("Reschedule edge must be immediate or round-end.")
+        };
+        if (current.Restart is { } existing && existing.Edge == restart.Edge && existing.MaxPlayers is null)
+            throw new ActivationProtocolException($"The pending activation already waits for the {edge} edge.");
+
+        var updated = await _store.UpdateAsync(current.Revision, record => record! with { Restart = restart }, cancellationToken).ConfigureAwait(false);
+        // Both target edges want the native flag armed, so an rnr LocalAdmin already sent stays;
+        // only this session's LocalAdmin-side intent is replaced.
+        ReleaseRestartEdge(disarmNativeRnr: false);
+        ArmPending(updated);
+        return await _store.LoadAsync(cancellationToken).ConfigureAwait(false) ?? updated;
+    }
+
+    /// <summary>
+    /// The game is exiting for a restart (native rnr at round end, restart_after_rounds, or the
+    /// rnr+restart sequence LocalAdmin sent). That restart is the edge a pending next-round or
+    /// immediate activation waits for, so commit it as activating before the relaunch applies the
+    /// staged files. A crash exit never commits; the next session re-arms the pending record.
+    /// </summary>
+    internal async Task<bool> CommitPendingForRestartExitAsync(CancellationToken cancellationToken = default)
+    {
+        var record = await _store.LoadAsync(cancellationToken).ConfigureAwait(false);
+        if (record is not { State: ActivationStates.Pending, Restart.Edge: "round-end" or "immediate" })
+            return false;
+        await _store.UpdateAsync(record.Revision, current => current! with { State = ActivationStates.Activating }, cancellationToken).ConfigureAwait(false);
+        return true;
+    }
+
+    /// <summary>Drops this session's restart intent and, when asked, any native rnr LocalAdmin itself armed.</summary>
+    private void ReleaseRestartEdge(bool disarmNativeRnr = true)
+    {
+        _restartIntents.TryCancel(new ActivationRestartHost(this, _host), out _);
+        _restartIntents.StopForSessionEnd();
+        if (disarmNativeRnr && _host.DisarmNativeRestartNextRoundIfOwned())
+            ConsoleUtil.WriteLine("Native restart-next-round armed by LocalAdmin was disarmed.", ConsoleColor.Gray);
     }
 
     internal async Task<ActivationRecord> AdoptRecoveryAsync(
@@ -400,6 +468,18 @@ internal sealed class ActivationCoordinator
                 ActivityOverPlayers = condition.ActivityOverPlayers,
                 Rounds = condition.Rounds
             };
+        }
+
+        // Next-round: the game itself owns the edge through its native restart-next-round flag
+        // (a toggle, so it is armed only when not already armed). The game's restart exit then
+        // commits the activation. LocalAdmin's own round-edge intent below stays as the fallback
+        // and provides the confirmed-empty early restart.
+        if (restart.Edge == "round-end" && restart.MaxPlayers is null && condition.Rounds == 1)
+        {
+            if (_host.EnsureNativeRestartNextRoundArmed())
+                ConsoleUtil.WriteLine($"Pending activation waits for the next round end ({_host.DescribeNativeRestartNextRound()}).", ConsoleColor.DarkGreen);
+            else
+                ConsoleUtil.WriteLine("Could not arm the native restart-next-round flag; LocalAdmin's round-edge intent is the only trigger.", ConsoleColor.Yellow);
         }
 
         if (!_restartIntents.TryArm(host, _tracker, "activation-" + restart.Preset, condition, out var message))

@@ -235,9 +235,9 @@ public sealed class ActivationCoordinatorTests : IDisposable
     private async Task<Setup> SetupActivatingAsync(
         bool stopAtPending = false,
         ActivationReadiness? readiness = null,
-        bool stopAtPrepared = false, ActivationRestart? restart = null)
+        bool stopAtPrepared = false, ActivationRestart? restart = null, string? root = null)
     {
-        var store = new ActivationRecordStore(_root, "example/prod");
+        var store = new ActivationRecordStore(root ?? _root, "example/prod");
         var host = new FakeHost();
         var hooks = new FakeHooks();
         var tracker = new PlayerCountTracker();
@@ -297,6 +297,105 @@ public sealed class ActivationCoordinatorTests : IDisposable
         Assert.False(setup.Host.ManagedRestartCommitInvoked);
         Assert.Equal(ActivationStates.Verified,
             (await setup.Coordinator.CancelAsync(before.ActivationId)).State);
+    }
+
+    [Fact]
+    public async Task Next_Round_Arm_Ensures_Native_Rnr_Without_Toggling_An_Operator_Arm()
+    {
+        var setup = await SetupNextRoundAsync();
+        await setup.Coordinator.OnChildStartedAsync();
+        Assert.Equal(new[] { "rnr" }, setup.Host.Commands);
+        Assert.True(setup.Host.NativeRnr.OwnedByLocalAdmin);
+        setup.Coordinator.StopForSessionEnd();
+
+        var operatorArmed = await SetupNextRoundAsync(SecondRoot);
+        operatorArmed.Host.NativeRnr.ObserveExitAction(LocalAdmin.V2.Core.LocalAdmin.ShutdownAction.Restart);
+        await operatorArmed.Coordinator.OnChildStartedAsync();
+        Assert.Empty(operatorArmed.Host.Commands);
+        operatorArmed.Coordinator.StopForSessionEnd();
+    }
+
+    [Fact]
+    public async Task Game_Restart_Exit_Commits_A_Pending_Next_Round_Activation()
+    {
+        var setup = await SetupNextRoundAsync();
+        await setup.Coordinator.OnChildStartedAsync();
+
+        Assert.True(await setup.Coordinator.CommitPendingForRestartExitAsync());
+        Assert.Equal(ActivationStates.Activating, (await setup.Store.LoadAsync())!.State);
+        Assert.False(await setup.Coordinator.CommitPendingForRestartExitAsync());
+        setup.Coordinator.StopForSessionEnd();
+
+        var resumed = new ActivationCoordinator(setup.Store, setup.Hooks, setup.Host, setup.Tracker);
+        var resume = await resumed.ResumeBeforeChildAsync();
+        Assert.True(resume.LaunchGame);
+        Assert.Equal(ActivationStates.Verifying, resume.Record!.State);
+        Assert.Contains("apply-target", setup.Hooks.Phases);
+    }
+
+    [Fact]
+    public async Task Empty_Edge_Pending_Activation_Does_Not_Commit_On_An_Unrelated_Restart()
+    {
+        var setup = await SetupActivatingAsync(stopAtPending: true,
+            restart: new ActivationRestart { Preset = "empty", Edge = "empty", MaxPlayers = 0, Rounds = null });
+
+        Assert.False(await setup.Coordinator.CommitPendingForRestartExitAsync());
+        Assert.Equal(ActivationStates.Pending, (await setup.Store.LoadAsync())!.State);
+    }
+
+    [Fact]
+    public async Task Reschedule_To_Immediate_Restarts_Now_With_Rnr_Already_Armed()
+    {
+        var setup = await SetupNextRoundAsync();
+        await setup.Coordinator.OnChildStartedAsync();
+        var before = (await setup.Store.LoadAsync())!;
+
+        var after = await setup.Coordinator.RescheduleAsync(before.ActivationId, before.Revision, "immediate");
+
+        Assert.Equal(ActivationStates.Activating, after.State);
+        Assert.Equal("immediate", after.Restart!.Edge);
+        Assert.Equal(before.ActivationId, after.ActivationId);
+        Assert.Equal(Pending, after.PendingCheckpoint);
+        Assert.True(setup.Host.ManagedRestartCommitInvoked);
+        // rnr was armed by the next-round edge; the immediate edge only adds the round restart.
+        Assert.Equal(new[] { "rnr", "restart" }, setup.Host.Commands);
+        setup.Coordinator.StopForSessionEnd();
+    }
+
+    [Fact]
+    public async Task Reschedule_Rejects_Stale_Revision_Same_Edge_And_Unknown_Edge()
+    {
+        var setup = await SetupNextRoundAsync();
+        var before = (await setup.Store.LoadAsync())!;
+
+        await Assert.ThrowsAsync<ActivationProtocolException>(() =>
+            setup.Coordinator.RescheduleAsync(before.ActivationId, before.Revision - 1, "immediate"));
+        await Assert.ThrowsAsync<ActivationProtocolException>(() =>
+            setup.Coordinator.RescheduleAsync(before.ActivationId, before.Revision, "round-end"));
+        await Assert.ThrowsAsync<ActivationProtocolException>(() =>
+            setup.Coordinator.RescheduleAsync(before.ActivationId, before.Revision, "empty"));
+        Assert.Equal(before.Revision, (await setup.Store.LoadAsync())!.Revision);
+        Assert.Empty(setup.Host.Commands);
+    }
+
+    [Fact]
+    public async Task Cancel_Disarms_Only_The_Rnr_LocalAdmin_Armed()
+    {
+        var setup = await SetupNextRoundAsync();
+        await setup.Coordinator.OnChildStartedAsync();
+        var record = (await setup.Store.LoadAsync())!;
+
+        Assert.Equal(ActivationStates.Verified, (await setup.Coordinator.CancelAsync(record.ActivationId)).State);
+        Assert.Equal(new[] { "rnr", "rnr" }, setup.Host.Commands);
+        Assert.False(setup.Host.NativeRnr.Armed);
+
+        var operatorArmed = await SetupNextRoundAsync(SecondRoot);
+        operatorArmed.Host.NativeRnr.ObserveExitAction(LocalAdmin.V2.Core.LocalAdmin.ShutdownAction.Restart);
+        await operatorArmed.Coordinator.OnChildStartedAsync();
+        var pending = (await operatorArmed.Store.LoadAsync())!;
+        await operatorArmed.Coordinator.CancelAsync(pending.ActivationId);
+        Assert.Empty(operatorArmed.Host.Commands);
+        Assert.True(operatorArmed.Host.NativeRnr.Armed);
     }
 
     [Fact]
@@ -375,8 +474,10 @@ public sealed class ActivationCoordinatorTests : IDisposable
         Assert.Equal(Pending, after.PendingCheckpoint);
     }
 
-    private Task<Setup> SetupNextRoundAsync() => SetupActivatingAsync(stopAtPending: true,
-        restart: new ActivationRestart { Preset = "next-round", Edge = "round-end", Rounds = 1, MaxPlayers = null });
+    private Task<Setup> SetupNextRoundAsync(string? root = null) => SetupActivatingAsync(stopAtPending: true,
+        restart: new ActivationRestart { Preset = "next-round", Edge = "round-end", Rounds = 1, MaxPlayers = null }, root: root);
+
+    private string SecondRoot => Path.Combine(_root, "second");
 
     private sealed record Setup(
         ActivationRecordStore Store,
@@ -444,6 +545,18 @@ public sealed class ActivationCoordinatorTests : IDisposable
         internal bool BlockProbe;
         internal bool ManagedRestartAccepted = true;
         internal bool ManagedRestartCommitInvoked;
+        internal readonly List<string> Commands = new();
+        internal readonly NativeRestartNextRoundTracker NativeRnr = new();
+        internal bool ConsoleConnected = true;
+        public bool EnsureNativeRestartNextRoundArmed() => ConsoleConnected && NativeRnr.EnsureArmed(Send);
+        public bool DisarmNativeRestartNextRoundIfOwned() => ConsoleConnected && NativeRnr.DisarmIfOwned(Send);
+        public string DescribeNativeRestartNextRound() => NativeRnr.Describe();
+        private bool Send(string command)
+        {
+            lock (Commands)
+                Commands.Add(command);
+            return true;
+        }
         internal TaskCompletionSource ProbeStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         internal TaskCompletionSource ProbeRelease { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public bool GameProcessRunning => true;
@@ -457,7 +570,10 @@ public sealed class ActivationCoordinatorTests : IDisposable
             if (!ManagedRestartAccepted)
                 return false;
             ManagedRestartCommitInvoked = true;
-            return commitActivation();
+            if (!commitActivation())
+                return false;
+            // Mirrors LocalAdmin.RequestScheduledRestart: the tracked native sequence.
+            return NativeRnr.TrySendRestartSequence(Send);
         }
         public void RequestPlayerCountRefresh() { }
         public bool ConfirmNotShuttingDown() => true;

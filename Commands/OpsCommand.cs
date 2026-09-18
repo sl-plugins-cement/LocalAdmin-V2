@@ -111,6 +111,13 @@ internal sealed partial class OpsCommand : CommandBase
                 message = "pending activation replaced; existing next-round intent preserved";
                 break;
 
+            case "reschedule" when args.Length == 4:
+                record = _coordinator.RescheduleAsync(args[1], RequiredLong(args[2], "expected revision"), args[3]).GetAwaiter().GetResult();
+                message = record.State == ActivationStates.Activating
+                    ? "pending activation rescheduled and restarting now"
+                    : $"pending activation rescheduled to the {args[3]} edge";
+                break;
+
             case "cancel" when args.Length == 2:
                 record = _coordinator.CancelAsync(args[1]).GetAwaiter().GetResult();
                 message = record.State == ActivationStates.Verified
@@ -142,7 +149,7 @@ internal sealed partial class OpsCommand : CommandBase
 
             default:
                 throw new ActivationProtocolException(
-                    "Usage: ops <request-id> status|bootstrap|prepare|arm|replace-pending|cancel|recovery-adopt|probe");
+                    "Usage: ops <request-id> status|bootstrap|prepare|arm|replace-pending|reschedule|cancel|recovery-adopt|probe");
         }
 
         return new OpsCommandResponse

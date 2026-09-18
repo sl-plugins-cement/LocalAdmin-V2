@@ -226,6 +226,11 @@ internal sealed partial class ActivationRecordStore
         }
     }
 
+    /// <summary>The two restart conditions a pending activation may be rescheduled to.</summary>
+    internal static bool IsReschedulableRestart(ActivationRestart? restart) => restart is
+        { Preset: "immediate", Edge: "immediate", MaxPlayers: null, Rounds: null } or
+        { Preset: "next-round", Edge: "round-end", MaxPlayers: null, Rounds: 1 };
+
     private static void ValidateTransition(ActivationRecord before, ActivationRecord after)
     {
         if (before.State == ActivationStates.Pending && after.State == ActivationStates.Pending &&
@@ -273,11 +278,17 @@ internal sealed partial class ActivationRecordStore
             var recordsRestoredRollback = before.State == ActivationStates.RollingBack &&
                                           before.CurrentCheckpoint == before.PendingCheckpoint &&
                                           after.CurrentCheckpoint == before.PreviousCheckpoint;
+            // A pending activation may be rescheduled to another supported restart edge (the
+            // scpsl-ops "pending edge" operation). Only the restart condition changes.
+            var reschedulesPending = before.State == ActivationStates.Pending &&
+                                     !Equals(before.Restart, after.Restart) &&
+                                     IsReschedulableRestart(after.Restart);
             var normalizedAfter = after with
             {
                 Revision = before.Revision,
                 UpdatedAt = before.UpdatedAt,
                 Checks = before.Checks,
+                Restart = reschedulesPending ? before.Restart : after.Restart,
                 PendingCheckpoint = finalizesPending
                     ? before.PendingCheckpoint
                     : after.PendingCheckpoint,
@@ -286,7 +297,7 @@ internal sealed partial class ActivationRecordStore
                     : after.CurrentCheckpoint
             };
             if (normalizedAfter != before)
-                Fail("A same-state revision may only append checks, finalize the pending manifest, or record an applied rollback.");
+                Fail("A same-state revision may only append checks, finalize the pending manifest, record an applied rollback, or reschedule a pending restart edge.");
             return;
         }
 

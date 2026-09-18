@@ -88,7 +88,10 @@ internal sealed class RestartWhenCommand : CommandBase
     {
         if (localAdmin.ManagedActivationBlocksRestartIntent(out var activationState))
         {
-            var message = $"Cannot arm a separate restart while managed activation is {activationState}. Use scpsl-ops status or cancel the pending activation.";
+            var lane = Core.LocalAdmin.Configuration?.OpsLane ?? "<lane>";
+            var message = $"Cannot arm a separate restart while managed activation is {activationState}. " +
+                          $"To restart the pending activation now run: scpsl-ops pending edge {lane} --now. " +
+                          $"To drop it run: scpsl-ops pending cancel {lane}.";
             ConsoleUtil.WriteLine(message, ConsoleColor.Yellow);
             WriteTyped("restartwhen.arm", ok: false, message);
             return;

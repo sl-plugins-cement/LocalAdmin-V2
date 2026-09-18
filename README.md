@@ -138,7 +138,20 @@ Presets (`restartwhen list` shows the live catalog):
 
 Safe presets poll once per second and never infer an empty server from missing or stale player data. Each request fires once and is cancellable until committed. `next-round` and `next-round-lowpop` remain compatibility aliases for existing callers; the old 30-minute presets are removed from the catalog. Managed deployment `-rnr` uses the safe behavior. Native game `rnr` remains game-owned and still waits for a round; use `restartwhen safe` for an empty-server fallback.
 
-中文：`safe` 在确认空服后立即重启，否则等待回合结束；`low-pop` 在空服时立即重启，否则等待人数少于 5 的回合结束；`now` 无论人数立即重启。只执行一次，不开启循环重启；未知或过期人数不会被当作空服。游戏原生 `rnr` 仍由游戏管理，空服回退请用 `restartwhen safe`。
+### Native `rnr` is a toggle, so LocalAdmin tracks it
+
+Every LocalAdmin-driven restart is SCP:SL's own sequence: native `rnr` (restart after the round)
+followed by native `restart` (round restart), which makes the game exit and LocalAdmin relaunch it.
+`rnr` toggles: sending it while an operator already armed it would silently cancel their restart
+and leave `restart` as a plain round restart. LocalAdmin therefore keeps a per-session belief about
+the flag, fed by the game itself (the `ExitActionRestart`/`ExitActionReset` control bytes and the
+`Server WILL/WON'T restart after next round.` reply), and sends `rnr` only when the flag is not
+already armed. A round that restarts without the game exiting resets the belief. LocalAdmin disarms
+the flag only when its own `rnr` armed it; an operator-armed `rnr` is left alone by cancellation.
+Source: `CommandSystem/Commands/Shared/RestartNextRoundCommand.cs` and
+`RoundRestarting/RoundRestart.cs` in the decompiled dedicated server.
+
+中文：`safe` 在确认空服后立即重启，否则等待回合结束；`low-pop` 在空服时立即重启，否则等待人数少于 5 的回合结束；`now` 无论人数立即重启。只执行一次，不开启循环重启；未知或过期人数不会被当作空服。游戏原生 `rnr` 是开关：LocalAdmin 根据游戏的控制字节记录其状态，只在未开启时发送 `rnr`，不会误关他人已设置的重启；只取消自己开启的 `rnr`。空服回退请用 `restartwhen safe`。
 
 ### Custom presets (JSON files)
 
@@ -211,6 +224,26 @@ If the candidate fails, LocalAdmin restores the previous checkpoint once. If the
 checkpoint also fails readiness, the record enters `recovery-required`, the child remains stopped,
 and the lock and evidence remain intact. There is no rollback loop. After explicit repair,
 `scpsl-ops recovery adopt` records the repaired checkpoint and starts a fresh session.
+
+### Restart edges of a pending activation
+
+A pending activation waits for one of two edges, matching the operator's `scpsl-ops` request:
+
+| Edge | What LocalAdmin does |
+|---|---|
+| `round-end` (`-rnr`) | Arms the game's native restart-next-round flag through the tracker above, so the game itself restarts after the current round. The `safe` intent stays armed as a fallback and restarts early once a fresh count confirms an empty server. |
+| `immediate` (`--now`) | Sends native `rnr` (only if not armed) then `restart`: the round restarts and the game exits at once. |
+
+Any game restart exit (native `rnr`, `restart_after_rounds`, or LocalAdmin's own sequence) commits a
+pending `round-end`/`immediate` activation to `activating`, so the relaunch applies the staged
+checkpoint. A crash exit never commits; the next session re-arms the pending record. An `empty`-edge
+activation ignores unrelated restarts and keeps waiting.
+
+`ops <request-id> reschedule <activation-id> <expected-revision> <immediate|round-end>` moves a
+pending activation to the other edge without re-staging: the record's `restart` is updated first,
+then `immediate` fires the sequence right away. `scpsl-ops pending edge <lane> --now` is the public
+form. While an activation is pending, `restartwhen` refuses a separate intent and names that command.
+Cancelling a pending activation also disarms the native flag when LocalAdmin armed it.
 
 The existing command channel carries the private machine protocol. Requests begin with `ops` and a
 UUID. Responses are one compact JSON line prefixed with `@@SCPSL_OPS_V1@@`, so a client can ignore

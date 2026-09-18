@@ -107,6 +107,33 @@ public sealed class ActivationRecordStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task Pending_May_Reschedule_Only_Its_Restart_Edge()
+    {
+        var store = new ActivationRecordStore(_root, "example/prod");
+        var verified = await store.UpdateAsync(-1, _ => Verified());
+        var prepared = await store.UpdateAsync(verified.Revision, _ => Open(verified, ActivationStates.Prepared));
+        var pending = await store.UpdateAsync(prepared.Revision, record => record! with { State = ActivationStates.Pending });
+
+        var nextRound = new ActivationRestart { Preset = "next-round", Edge = "round-end", MaxPlayers = null, Rounds = 1 };
+        var rescheduled = await store.UpdateAsync(pending.Revision, record => record! with { Restart = nextRound });
+        Assert.Equal(nextRound, rescheduled.Restart);
+        Assert.Equal(ActivationStates.Pending, rescheduled.State);
+
+        // An unsupported edge, or a reschedule that also touches another field, is refused.
+        await Assert.ThrowsAsync<ActivationProtocolException>(() => store.UpdateAsync(rescheduled.Revision, record => record! with
+        {
+            Restart = new ActivationRestart { Preset = "empty", Edge = "empty", MaxPlayers = 0, Rounds = null }
+        }));
+        await Assert.ThrowsAsync<ActivationProtocolException>(() => store.UpdateAsync(rescheduled.Revision, record => record! with
+        {
+            Restart = Open(verified, ActivationStates.Pending).Restart,
+            PendingCheckpoint = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        }));
+        // Prepared records are not reschedulable: the edge is fixed at arm time.
+        await Assert.ThrowsAsync<ActivationProtocolException>(() => store.UpdateAsync(prepared.Revision, record => record! with { Restart = nextRound }));
+    }
+
+    [Fact]
     public async Task New_Activation_Resets_Checks_Retained_By_The_Verified_Record()
     {
         // A verified record keeps the previous activation's readiness evidence. Preparing the

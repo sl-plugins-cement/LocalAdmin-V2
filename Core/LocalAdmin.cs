@@ -63,6 +63,11 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost, IActivationHo
     private static ConsoleInputPump? _keyboardInputPump;
     private readonly PlayerCountTracker _playerTracker = new();
     internal PlayerCountTracker PlayerTracker => _playerTracker;
+
+    // Per-session belief about the game's native "restart next round" toggle, fed by the game's
+    // exit-action control bytes and the rnr reply text. A new game process starts unarmed.
+    private readonly NativeRestartNextRoundTracker _nativeRnr = new();
+    internal NativeRestartNextRoundTracker NativeRestartNextRound => _nativeRnr;
     private readonly PlayerProbeCoordinator _playerProbe;
     private CancellationTokenSource? _policyCts;
     private ActivationCoordinator? _activation;
@@ -1042,6 +1047,22 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost, IActivationHo
                     ConsoleUtil.WriteLine($"Failed to record managed activation child exit: {ex.Message}", ConsoleColor.Red);
                 }
 
+                // The game restarting itself (native rnr at round end, restart_after_rounds, or a
+                // LocalAdmin-sent rnr+restart) is the edge a pending next-round/immediate
+                // activation waits for: commit it so the relaunch applies the staged files.
+                if (ExitAction == ShutdownAction.Restart && _activation != null)
+                {
+                    try
+                    {
+                        if (_activation.CommitPendingForRestartExitAsync().GetAwaiter().GetResult())
+                            ConsoleUtil.WriteLine("Game restart observed; the pending managed activation applies on relaunch.", ConsoleColor.Cyan);
+                    }
+                    catch (Exception ex)
+                    {
+                        ConsoleUtil.WriteLine($"Failed to commit the pending managed activation for this restart: {ex.Message}", ConsoleColor.Red);
+                    }
+                }
+
                 switch (ExitAction)
                 {
                     case ShutdownAction.Crash:
@@ -1364,6 +1385,9 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost, IActivationHo
     /// </summary>
     internal void NotifyRoundRestart()
     {
+        // A round that restarted without the game exiting proves the native rnr flag was not
+        // armed at that edge, whatever LocalAdmin believed.
+        _nativeRnr.ObserveRoundRestart();
         if (!_sawInitialRoundRestart)
         {
             _sawInitialRoundRestart = true;
@@ -1416,7 +1440,9 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost, IActivationHo
             var server = Server;
             if (server is { Connected: true })
             {
-                if (TrySendNativeRestartCommands(server.WriteLine))
+                // rnr is a toggle: the tracker sends it only when the flag is not already armed,
+                // so an operator's pending native restart is never flipped off by accident.
+                if (_nativeRnr.TrySendRestartSequence(server.WriteLine))
                     return true;
 
                 ConsoleUtil.WriteLine(
@@ -1429,16 +1455,6 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost, IActivationHo
             _exit = true;
             return true;
         }
-    }
-
-    /// <summary>
-    /// Sends SCP:SL's native full-restart sequence in strict order. If <c>rnr</c> cannot be sent,
-    /// <c>restart</c> is not sent because it would only restart the current round.
-    /// </summary>
-    internal static bool TrySendNativeRestartCommands(Func<string, bool> sendCommand)
-    {
-        ArgumentNullException.ThrowIfNull(sendCommand);
-        return sendCommand("rnr") && sendCommand("restart");
     }
 
     /// <summary>
@@ -1485,6 +1501,9 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost, IActivationHo
 
     internal bool TryApplyGameExitAction(ShutdownAction action)
     {
+        // The control byte reports the game's StopNextRound flag even after LocalAdmin has
+        // claimed the exit action; the tracker must keep following it.
+        _nativeRnr.ObserveExitAction(action);
         lock (this)
         {
             if (DisableExitActionSignals)
@@ -1517,12 +1536,27 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost, IActivationHo
             _playerTracker.ProcessConsoleLine(strippedLine, DateTime.UtcNow, out var acceptedPlayersReply);
             if (acceptedPlayersReply.HasValue)
                 _playerProbe.AcceptReply(acceptedPlayersReply.Value, DateTime.UtcNow);
+            _nativeRnr.ObserveConsoleLine(strippedLine);
         }
         catch
         {
             // tracker must never break console output
         }
     }
+
+    bool IActivationHost.EnsureNativeRestartNextRoundArmed()
+    {
+        var server = Server;
+        return server is { Connected: true } && _nativeRnr.EnsureArmed(server.WriteLine);
+    }
+
+    bool IActivationHost.DisarmNativeRestartNextRoundIfOwned()
+    {
+        var server = Server;
+        return server is { Connected: true } && _nativeRnr.DisarmIfOwned(server.WriteLine);
+    }
+
+    string IActivationHost.DescribeNativeRestartNextRound() => _nativeRnr.Describe();
 
     internal void NotifyIdleEnter() => _playerTracker.NotifyIdleEnter();
 
