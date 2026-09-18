@@ -44,16 +44,37 @@ public sealed class RestartIntentManagerTests
     [Theory]
     [InlineData("safe")]
     [InlineData("low-pop")]
-    public void SafePresets_RequireFreshEmptyCount_AndFireOnce(string name)
+    public void SafePresets_FireOnceOnTheGamesIdleSignal_WithoutPolling(string name)
     {
         var manager = new RestartIntentManager(); var host = new FakeHost();
-        var tracker = TrackerWithFreshCount(0, T0);
+        var tracker = new PlayerCountTracker();
         Assert.True(RestartPresets.TryGet(name, out var preset));
         Assert.True(manager.TryArm(host, tracker, name, preset.Condition, out _));
-        Assert.False(manager.EvaluateImmediateOrEmpty(host, tracker, T0.AddSeconds(6)));
-        Assert.True(manager.EvaluateImmediateOrEmpty(host, tracker, T0));
-        Assert.False(manager.EvaluateImmediateOrEmpty(host, tracker, T0));
-        Assert.Equal(1, host.ScheduledRestarts); manager.StopForSessionEnd();
+        // Nothing known about the population: no restart, and no players poll to find out.
+        manager.NotifyIdleEnter(host, tracker);
+        Assert.Equal(0, host.ScheduledRestarts);
+        Assert.Equal(0, host.RefreshRequests);
+        // The game reports idle mode (its authoritative "0 players"): fire once.
+        tracker.NotifyIdleEnter(T0);
+        manager.NotifyIdleEnter(host, tracker);
+        Assert.Equal(1, host.ScheduledRestarts);
+        Assert.False(manager.EvaluateImmediateOrEmpty(host, tracker));
+        Assert.Equal(0, host.RefreshRequests); manager.StopForSessionEnd();
+    }
+
+    [Theory]
+    [InlineData("safe")]
+    [InlineData("low-pop")]
+    public void SafePresets_DoNotFireOnAnEmptyCountThatAJoinInvalidated(string name)
+    {
+        var manager = new RestartIntentManager(); var host = new FakeHost();
+        var tracker = new PlayerCountTracker();
+        tracker.NotifyIdleEnter(T0);
+        tracker.NotifyIdleExit(T0.AddSeconds(1));
+        Assert.True(RestartPresets.TryGet(name, out var preset));
+        Assert.True(manager.TryArm(host, tracker, name, preset.Condition, out _));
+        Assert.False(manager.EvaluateImmediateOrEmpty(host, tracker));
+        Assert.Equal(0, host.ScheduledRestarts); manager.StopForSessionEnd();
     }
 
     [Theory]
@@ -65,7 +86,7 @@ public sealed class RestartIntentManagerTests
         var manager = new RestartIntentManager(); var host = new FakeHost(); var tracker = TrackerWithFreshCount(players, T0);
         Assert.True(RestartPresets.TryGet(name, out var preset));
         Assert.True(manager.TryArm(host, tracker, name, preset.Condition, out _));
-        Assert.False(manager.EvaluateImmediateOrEmpty(host, tracker, T0));
+        Assert.False(manager.EvaluateImmediateOrEmpty(host, tracker));
         manager.NotifyRoundRestart(host, tracker, T0); Assert.Equal(expected, host.ScheduledRestarts);
         manager.StopForSessionEnd();
     }
@@ -77,9 +98,10 @@ public sealed class RestartIntentManagerTests
         Assert.True(RestartPresets.TryGet("now", out var preset));
         Assert.True(manager.TryArm(host, tracker, "now", preset.Condition, out _));
         Assert.True(manager.TryCancel(host, out _));
-        Assert.False(manager.EvaluateImmediateOrEmpty(host, tracker, T0));
+        Assert.False(manager.EvaluateImmediateOrEmpty(host, tracker));
         Assert.True(manager.TryArm(host, tracker, "now", preset.Condition, out _));
-        Assert.True(manager.EvaluateImmediateOrEmpty(host, tracker, T0)); manager.StopForSessionEnd();
+        Assert.True(manager.EvaluateImmediateOrEmpty(host, tracker));
+        Assert.Equal(0, host.RefreshRequests); manager.StopForSessionEnd();
     }
 
     [Fact]

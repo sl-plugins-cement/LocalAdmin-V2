@@ -1558,7 +1558,14 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost, IActivationHo
 
     string IActivationHost.DescribeNativeRestartNextRound() => _nativeRnr.Describe();
 
-    internal void NotifyIdleEnter() => _playerTracker.NotifyIdleEnter();
+    internal void NotifyIdleEnter()
+    {
+        _playerTracker.NotifyIdleEnter();
+        // The game's own "no players" signal is the only empty-server trigger for restart intents;
+        // LocalAdmin never polls the player list to find out.
+        RestartIntents.NotifyIdleEnter(this, _playerTracker);
+        _activation?.NotifyIdleEnter();
+    }
 
     internal void NotifyIdleExit() => _playerTracker.NotifyIdleExit();
 

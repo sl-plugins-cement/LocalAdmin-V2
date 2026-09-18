@@ -328,7 +328,11 @@ internal sealed class RestartIntentManager
 
                 case RestartEdge.Immediate:
                 case RestartEdge.RoundEnd when intent.Condition.RestartIfEmpty:
-                    StartSafePoller(host, tracker, intent, token);
+                    // No polling: evaluate once after arming has published the readable intent.
+                    // An immediate intent fires then; an empty-fallback intent fires only if the
+                    // game already reported idle mode, and otherwise waits for the IdleEnter byte
+                    // (see NotifyIdleEnter) or the round edge.
+                    StartDeferredEvaluation(host, tracker, intent, token);
                     break;
                 case RestartEdge.RoundEnd when intent.Condition.MaxPlayers.HasValue:
                     StartGatePoller(host, token);
@@ -393,17 +397,19 @@ internal sealed class RestartIntentManager
     }
 
     /// <summary>
-    /// Keeps a fresh authoritative player count available while a player-gated round intent is
-    /// armed, so the gate can be evaluated the moment the round-restart edge arrives.
+    /// Fires an immediate intent, or an empty-fallback round intent once the game itself has
+    /// reported an empty server. "Empty" is the tracker's authoritative zero, which only the
+    /// game's IdleEnter control byte or a solicited <c>players</c> reply can set and which any
+    /// join or IdleExit invalidates, so no polling is needed to trust it.
     /// </summary>
-    internal bool EvaluateImmediateOrEmpty(IRestartHost host, PlayerCountTracker tracker, DateTime nowUtc)
+    internal bool EvaluateImmediateOrEmpty(IRestartHost host, PlayerCountTracker tracker)
     {
         lock (_lock)
         {
             if (_pending == null || _firing || host.IsShuttingDown || host.RestartInProgress) return false;
             var condition = _pending.Condition;
             if (condition.Edge != RestartEdge.Immediate &&
-                (!condition.RestartIfEmpty || !tracker.TryGetFreshCount(nowUtc, TimeSpan.FromSeconds(5), out var players) || players != 0)) return false;
+                (!condition.RestartIfEmpty || !tracker.TryGetKnownCount(out var players) || players != 0)) return false;
             _firing = true;
         }
         var scheduled = false;
@@ -414,20 +420,31 @@ internal sealed class RestartIntentManager
         }
     }
 
-    private void StartSafePoller(IRestartHost host, PlayerCountTracker tracker, PendingIntent intent, CancellationToken token)
+    /// <summary>
+    /// The game entered idle mode (no players): the event that lets an empty-fallback round
+    /// intent restart early. Called from the IdleEnter control byte, never from a poll.
+    /// </summary>
+    internal void NotifyIdleEnter(IRestartHost host, PlayerCountTracker tracker)
+    {
+        lock (_lock)
+        {
+            if (_pending is not { Condition: { Edge: RestartEdge.RoundEnd, RestartIfEmpty: true } })
+                return;
+        }
+        if (EvaluateImmediateOrEmpty(host, tracker))
+            ConsoleUtil.WriteLine("Server reported empty; performing the scheduled restart now instead of waiting for the round.", ConsoleColor.Cyan);
+    }
+
+    private void StartDeferredEvaluation(IRestartHost host, PlayerCountTracker tracker, PendingIntent intent, CancellationToken token)
     {
         _ = Task.Run(async () =>
         {
             try
             {
-                // Let arming publish its readable intent before evaluating it.
-                while (true)
-                {
-                    await Task.Delay(TimeSpan.FromSeconds(1), token).ConfigureAwait(false);
-                    lock (_lock) { if (!ReferenceEquals(_pending, intent)) return; }
-                    if (EvaluateImmediateOrEmpty(host, tracker, DateTime.UtcNow)) return;
-                    try { host.RequestPlayerCountRefresh(); } catch { /* retry next tick */ }
-                }
+                // Let arming publish its readable intent before evaluating it, once.
+                await Task.Delay(TimeSpan.FromSeconds(1), token).ConfigureAwait(false);
+                lock (_lock) { if (!ReferenceEquals(_pending, intent)) return; }
+                EvaluateImmediateOrEmpty(host, tracker);
             }
             catch (OperationCanceledException) { }
         }, token);

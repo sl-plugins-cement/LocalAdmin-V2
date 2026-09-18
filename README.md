@@ -136,7 +136,7 @@ Presets (`restartwhen list` shows the live catalog):
 | `low-pop` | Restart as soon as confirmed empty; otherwise at a round end with fewer than 5 players. |
 | `now` | Restart immediately, even with players connected. |
 
-Safe presets poll once per second and never infer an empty server from missing or stale player data. Each request fires once and is cancellable until committed. `next-round` and `next-round-lowpop` remain compatibility aliases for existing callers; the old 30-minute presets are removed from the catalog. Managed deployment `-rnr` uses the safe behavior. Native game `rnr` remains game-owned and still waits for a round; use `restartwhen safe` for an empty-server fallback.
+Safe presets never poll. The empty-server fallback fires only on the game's own idle-mode signal (the `IdleEnter` control byte, or an idle state already known when arming); LocalAdmin does not send `players` to find out, and never infers an empty server from missing or stale data. Each request fires once and is cancellable until committed. `next-round` and `next-round-lowpop` remain compatibility aliases for existing callers; the old 30-minute presets are removed from the catalog. Managed deployment `-rnr` uses the safe behavior. Native game `rnr` remains game-owned and still waits for a round; use `restartwhen safe` for an empty-server fallback.
 
 ### Native `rnr` is a toggle, so LocalAdmin tracks it
 
@@ -231,7 +231,7 @@ A pending activation waits for one of two edges, matching the operator's `scpsl-
 
 | Edge | What LocalAdmin does |
 |---|---|
-| `round-end` (`-rnr`) | Arms the game's native restart-next-round flag through the tracker above, so the game itself restarts after the current round. The `safe` intent stays armed as a fallback and restarts early once a fresh count confirms an empty server. |
+| `round-end` (`-rnr`) | Arms the game's native restart-next-round flag through the tracker above, so the game itself restarts after the current round. The `safe` intent stays armed as a fallback and restarts early when the game reports idle mode (an empty server), without polling. |
 | `immediate` (`--now`) | Sends native `rnr` (only if not armed) then `restart`: the round restarts and the game exits at once. |
 
 Any game restart exit (native `rnr`, `restart_after_rounds`, or LocalAdmin's own sequence) commits a

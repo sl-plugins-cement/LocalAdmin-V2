@@ -207,6 +207,8 @@ internal sealed class ActivationCoordinator
 
     internal void NotifyRoundRestart() => _restartIntents.NotifyRoundRestart(new ActivationRestartHost(this, _host), _tracker);
 
+    internal void NotifyIdleEnter() => _restartIntents.NotifyIdleEnter(new ActivationRestartHost(this, _host), _tracker);
+
     internal void StopForSessionEnd()
     {
         _restartIntents.StopForSessionEnd();
@@ -473,7 +475,7 @@ internal sealed class ActivationCoordinator
         // Next-round: the game itself owns the edge through its native restart-next-round flag
         // (a toggle, so it is armed only when not already armed). The game's restart exit then
         // commits the activation. LocalAdmin's own round-edge intent below stays as the fallback
-        // and provides the confirmed-empty early restart.
+        // and restarts early when the game reports idle mode (no polling).
         if (restart.Edge == "round-end" && restart.MaxPlayers is null && condition.Rounds == 1)
         {
             if (_host.EnsureNativeRestartNextRoundArmed())
