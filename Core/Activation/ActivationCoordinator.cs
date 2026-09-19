@@ -324,10 +324,18 @@ internal sealed class ActivationCoordinator
     {
         var current = await _store.LoadAsync(cancellationToken).ConfigureAwait(false)
                       ?? throw new ActivationProtocolException("activation.json does not exist.");
-        if (current.ActivationId != activationId || current.State is not (ActivationStates.Prepared or ActivationStates.Pending))
-            throw new ActivationProtocolException("Only the matching prepared or pending activation can be cancelled.");
+        if (current.ActivationId != activationId ||
+            current.State is not (ActivationStates.Prepared or ActivationStates.Pending or ActivationStates.Cancelled))
+        {
+            throw new ActivationProtocolException("Only the matching prepared, pending, or cancelled activation can be cancelled.");
+        }
 
-        var cancelled = await _store.UpdateAsync(current.Revision, record => record! with { State = ActivationStates.Cancelled }, cancellationToken).ConfigureAwait(false);
+        // A record left in `cancelled` because staging cleanup failed used to wait for the next
+        // LocalAdmin session, holding the lane lock meanwhile. Cancelling it again retries the
+        // cleanup in place so the lane can return to verified without a restart.
+        var cancelled = current.State == ActivationStates.Cancelled
+            ? current
+            : await _store.UpdateAsync(current.Revision, record => record! with { State = ActivationStates.Cancelled }, cancellationToken).ConfigureAwait(false);
         ReleaseRestartEdge();
         var result = await RunHookSafeAsync("cleanup", cancelled, cancellationToken).ConfigureAwait(false);
         if (!result.Ok)

@@ -399,6 +399,28 @@ public sealed class ActivationCoordinatorTests : IDisposable
     }
 
     [Fact]
+    public async Task Cancel_Retries_A_Failed_Cleanup_Without_Waiting_For_A_New_Session()
+    {
+        var setup = await SetupNextRoundAsync();
+        await setup.Coordinator.OnChildStartedAsync();
+        var pending = (await setup.Store.LoadAsync())!;
+        setup.Hooks.FailCleanup = true;
+
+        var stuck = await setup.Coordinator.CancelAsync(pending.ActivationId);
+        Assert.Equal(ActivationStates.Cancelled, stuck.State);
+        Assert.NotNull(stuck.Lock);
+        await Assert.ThrowsAsync<ActivationProtocolException>(() => setup.Coordinator.CancelAsync(Guid.NewGuid().ToString("D")));
+
+        setup.Hooks.FailCleanup = false;
+        var released = await setup.Coordinator.CancelAsync(pending.ActivationId);
+        Assert.Equal(ActivationStates.Verified, released.State);
+        Assert.Null(released.Lock);
+        Assert.Equal(Current, released.CurrentCheckpoint);
+        Assert.Equal(2, setup.Hooks.Phases.FindAll(phase => phase == "cleanup").Count);
+        setup.Coordinator.StopForSessionEnd();
+    }
+
+    [Fact]
     public async Task Pending_Replacement_Preserves_Intent_And_Next_Round_Activates_New_Batch()
     {
         var setup = await SetupNextRoundAsync();
@@ -495,6 +517,7 @@ public sealed class ActivationCoordinatorTests : IDisposable
         internal bool NullCheckpointOnFailure;
         internal bool IncludeVerificationProof = true;
         internal bool FailRollbackApply;
+        internal bool FailCleanup;
         internal bool FailPreflight;
         internal TimeSpan VerificationDelay;
 
@@ -510,6 +533,7 @@ public sealed class ActivationCoordinatorTests : IDisposable
             {
                 "preflight" or "preflight-replacement" => !FailPreflight,
                 "apply-rollback" => !FailRollbackApply,
+                "cleanup" => !FailCleanup,
                 "verify-runtime" => isPrevious ? VerifyPreviousOk : VerifyPendingOk,
                 _ => true
             };

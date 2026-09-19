@@ -122,7 +122,7 @@ internal sealed partial class OpsCommand : CommandBase
                 record = _coordinator.CancelAsync(args[1]).GetAwaiter().GetResult();
                 message = record.State == ActivationStates.Verified
                     ? "pending activation cancelled and staging cleaned"
-                    : "activation cancelled; staging cleanup must be retried";
+                    : "activation cancelled; staging cleanup failed, repeat the cancel to retry it";
                 break;
 
             case "recovery-adopt" or "adopt" when args.Length == 4:
