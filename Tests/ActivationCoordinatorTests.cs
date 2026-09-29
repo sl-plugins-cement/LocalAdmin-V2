@@ -21,7 +21,7 @@ public sealed class ActivationCoordinatorTests : IDisposable
         var setup = await SetupActivatingAsync();
         var resume = await setup.Coordinator.ResumeBeforeChildAsync();
 
-        Assert.True(resume.LaunchGame);
+        Assert.False(resume.NeedsRepair);
         Assert.Equal(ActivationStates.Verifying, resume.Record!.State);
         Assert.Equal(Pending, resume.Record.CurrentCheckpoint);
         Assert.Equal(new[] { "preflight", "apply-target" }, setup.Hooks.Phases);
@@ -78,7 +78,7 @@ public sealed class ActivationCoordinatorTests : IDisposable
 
         var rollbackCoordinator = new ActivationCoordinator(setup.Store, setup.Hooks, setup.Host, setup.Tracker);
         var resume = await rollbackCoordinator.ResumeBeforeChildAsync();
-        Assert.True(resume.LaunchGame);
+        Assert.False(resume.NeedsRepair);
         Assert.Equal(ActivationStates.RollingBack, resume.Record!.State);
         Assert.Equal(Current, resume.Record.CurrentCheckpoint);
         await rollbackCoordinator.OnChildStartedAsync();
@@ -91,7 +91,7 @@ public sealed class ActivationCoordinatorTests : IDisposable
     }
 
     [Fact]
-    public async Task Failed_Rollback_Readiness_Stops_In_Recovery_Without_Second_Rollback()
+    public async Task Failed_Rollback_Readiness_Keeps_The_Game_Running_In_Recovery()
     {
         var setup = await SetupActivatingAsync();
         setup.Hooks.VerifyPendingOk = false;
@@ -107,13 +107,14 @@ public sealed class ActivationCoordinatorTests : IDisposable
 
         Assert.True(recovery.RollbackAttempted);
         Assert.NotNull(recovery.Lock);
-        Assert.NotNull(recovery.LastError);
-        Assert.Equal(2, setup.Host.ForcedRestarts);
+        Assert.Contains("keeps running", recovery.LastError);
+        // Only the candidate failure restarts (into the rollback); the rollback target is left running.
+        Assert.Equal(1, setup.Host.ForcedRestarts);
         Assert.Single(setup.Hooks.Phases.FindAll(p => p == "apply-rollback"));
 
         var afterRestart = new ActivationCoordinator(setup.Store, setup.Hooks, setup.Host, setup.Tracker);
-        var held = await afterRestart.ResumeBeforeChildAsync();
-        Assert.False(held.LaunchGame);
+        var resume = await afterRestart.ResumeBeforeChildAsync();
+        Assert.True(resume.NeedsRepair);
         Assert.Single(setup.Hooks.Phases.FindAll(p => p == "apply-rollback"));
     }
 
@@ -202,7 +203,7 @@ public sealed class ActivationCoordinatorTests : IDisposable
         var rollbackCoordinator = new ActivationCoordinator(setup.Store, setup.Hooks, setup.Host, setup.Tracker);
         var resume = await rollbackCoordinator.ResumeBeforeChildAsync();
 
-        Assert.False(resume.LaunchGame);
+        Assert.True(resume.NeedsRepair);
         Assert.Equal(ActivationStates.RecoveryRequired, resume.Record!.State);
         Assert.Equal(Pending, resume.Record.CurrentCheckpoint);
     }
@@ -328,7 +329,7 @@ public sealed class ActivationCoordinatorTests : IDisposable
 
         var resumed = new ActivationCoordinator(setup.Store, setup.Hooks, setup.Host, setup.Tracker);
         var resume = await resumed.ResumeBeforeChildAsync();
-        Assert.True(resume.LaunchGame);
+        Assert.False(resume.NeedsRepair);
         Assert.Equal(ActivationStates.Verifying, resume.Record!.State);
         Assert.Contains("apply-target", setup.Hooks.Phases);
     }

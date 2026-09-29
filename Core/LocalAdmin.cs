@@ -587,27 +587,22 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost, IActivationHo
             if (_activation != null)
                 activationResume = await _activation.ResumeBeforeChildAsync().ConfigureAwait(false);
             else if (_activationInitializationError != null)
-                activationResume = new ActivationResumeResult(false, _activationInitializationError, null);
+                activationResume = new ActivationResumeResult(true, _activationInitializationError, null);
 
-            if (activationResume is not { LaunchGame: false })
-                StartRestartWhenEmptyPolicy();
+            StartRestartWhenEmptyPolicy();
 
             // Re-arm any one-shot restart intents carried over from a previous session.
-            if (activationResume is not { LaunchGame: false })
-                RearmPendingRestartIntent();
+            RearmPendingRestartIntent();
 
             _readerTask!.Start();
 
-            if (activationResume is { LaunchGame: false } hold)
-            {
-                ConsoleUtil.WriteLine($"Game child held stopped by managed activation: {hold.Message}", ConsoleColor.Red);
-            }
-            else
-            {
-                StartSession();
-                if (_activation != null)
-                    await _activation.OnChildStartedAsync().ConfigureAwait(false);
-            }
+            // Managed activation reports problems but never keeps the game from starting.
+            if (activationResume is { NeedsRepair: true } repair)
+                ConsoleUtil.WriteLine($"Managed activation needs repair; starting the game anyway: {repair.Message}", ConsoleColor.Red);
+
+            StartSession();
+            if (_activation != null)
+                await _activation.OnChildStartedAsync().ConfigureAwait(false);
 
             if (autoEula)
                 ConsoleUtil.WriteLine("SCP: Secret Laboratory EULA (https://link.scpslgame.com/eula) was accepted by providing a startup argument or setting an environment variable.", ConsoleColor.Yellow);

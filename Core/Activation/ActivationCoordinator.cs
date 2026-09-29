@@ -34,11 +34,14 @@ internal interface IActivationHost : IRestartHost
     string DescribeNativeRestartNextRound();
 }
 
-internal sealed record ActivationResumeResult(bool LaunchGame, string Message, ActivationRecord? Record);
+/// <param name="NeedsRepair">The lane needs operator attention. The game still starts.</param>
+internal sealed record ActivationResumeResult(bool NeedsRepair, string Message, ActivationRecord? Record);
 
 /// <summary>
 /// Durable activation state machine. It supervises the game and invokes fixed scpsl-ops hooks; it
 /// never interprets checkpoint manifests or writes managed game files itself.
+/// It never keeps the game stopped: LabAPI already skips a plugin that fails to load, so a failed
+/// check or an unreadable record is reported for repair while the server keeps serving.
 /// </summary>
 internal sealed class ActivationCoordinator
 {
@@ -74,18 +77,18 @@ internal sealed class ActivationCoordinator
         }
         catch (ActivationProtocolException ex)
         {
-            return new(false, ex.Message, null);
+            return new(true, ex.Message, null);
         }
 
         if (record == null)
-            return new(false, "Managed activation is enabled but activation.json does not exist. Bootstrap it through scpsl-ops.", null);
+            return new(true, "Managed activation is enabled but activation.json does not exist. Bootstrap it through scpsl-ops.", null);
 
         while (true)
         {
             switch (record.State)
             {
                 case ActivationStates.RecoveryRequired:
-                    return new(false, record.LastError ?? "Recovery is required.", record);
+                    return new(true, record.LastError ?? "Recovery is required.", record);
 
                 case ActivationStates.Cancelled:
                 {
@@ -118,7 +121,7 @@ internal sealed class ActivationCoordinator
                         Checks = Append(current.Checks, result.Checks),
                         LastError = null
                     }, cancellationToken).ConfigureAwait(false);
-                    return new(true, "Target files applied; starting readiness verification.", record);
+                    return new(false, "Target files applied; starting readiness verification.", record);
                 }
 
                 case ActivationStates.RollingBack:
@@ -127,13 +130,13 @@ internal sealed class ActivationCoordinator
                     if (!result.Ok)
                     {
                         record = await EnterRecoveryAsync(record, result.Error ?? "rollback apply failed", result.Checks, cancellationToken).ConfigureAwait(false);
-                        return new(false, record.LastError!, record);
+                        return new(true, record.LastError!, record);
                     }
 
                     if (result.Checkpoint != record.PreviousCheckpoint)
                     {
                         record = await EnterRecoveryAsync(record, "rollback hook returned the wrong checkpoint", result.Checks, cancellationToken).ConfigureAwait(false);
-                        return new(false, record.LastError!, record);
+                        return new(true, record.LastError!, record);
                     }
 
                     record = await _store.UpdateAsync(record.Revision, current => current! with
@@ -141,11 +144,11 @@ internal sealed class ActivationCoordinator
                         CurrentCheckpoint = current.PreviousCheckpoint,
                         Checks = Append(current.Checks, result.Checks)
                     }, cancellationToken).ConfigureAwait(false);
-                    return new(true, "Previous checkpoint restored; starting rollback readiness verification.", record);
+                    return new(false, "Previous checkpoint restored; starting rollback readiness verification.", record);
                 }
 
                 default:
-                    return new(true, $"Activation state is {record.State}.", record);
+                    return new(false, $"Activation state is {record.State}.", record);
             }
         }
     }
@@ -198,7 +201,7 @@ internal sealed class ActivationCoordinator
 
         if (target == "previous" && record.State == ActivationStates.RollingBack)
         {
-            await EnterRecoveryAsync(record, "rollback target game child exited during readiness; game child stopped", Array.Empty<ActivationCheck>(), cancellationToken).ConfigureAwait(false);
+            await EnterRecoveryAsync(record, "rollback target game child exited during readiness", Array.Empty<ActivationCheck>(), cancellationToken).ConfigureAwait(false);
             return true;
         }
 
@@ -646,16 +649,23 @@ internal sealed class ActivationCoordinator
                 await EnterRollbackAsync(latest, error, checks, cancellationToken).ConfigureAwait(false);
             else if (latest.State is not (ActivationStates.RollingBack or ActivationStates.RecoveryRequired or ActivationStates.Verified))
                 throw new ActivationProtocolException($"Cannot fail pending readiness from state {latest.State}.");
-        }
-        else
-        {
-            if (latest.State == ActivationStates.RollingBack)
-                await EnterRecoveryAsync(latest, "rollback target failed readiness; game child stopped: " + error, checks, cancellationToken).ConfigureAwait(false);
-            else if (latest.State is not (ActivationStates.RecoveryRequired or ActivationStates.Verified))
-                throw new ActivationProtocolException($"Cannot fail rollback readiness from state {latest.State}.");
+
+            _host.ForceActivationSessionRestart("managed activation readiness failed; restoring the previous checkpoint");
+            return;
         }
 
-        _host.ForceActivationSessionRestart("managed activation readiness failed");
+        // The rollback target is the last known-good build. Restarting it again cannot help, so
+        // the running game is left alone: a plugin that failed to load is already skipped by
+        // LabAPI, and a dead child is relaunched by LocalAdmin's normal crash handling.
+        if (latest.State == ActivationStates.RollingBack)
+        {
+            await EnterRecoveryAsync(latest, "rollback target failed readiness; the game keeps running: " + error, checks, cancellationToken).ConfigureAwait(false);
+            ConsoleUtil.WriteLine("Managed activation needs repair (recovery-required); the game keeps running.", ConsoleColor.Red);
+        }
+        else if (latest.State is not (ActivationStates.RecoveryRequired or ActivationStates.Verified))
+        {
+            throw new ActivationProtocolException($"Cannot fail rollback readiness from state {latest.State}.");
+        }
     }
 
     private async Task<ActivationRecord> EnterRollbackAsync(

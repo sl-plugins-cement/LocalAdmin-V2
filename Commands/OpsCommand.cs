@@ -72,7 +72,6 @@ internal sealed partial class OpsCommand : CommandBase
                     args[2],
                     Readiness(args[3], args[4], args[5], args[6])).GetAwaiter().GetResult();
                 message = "verified activation record created";
-                Core.LocalAdmin.Singleton!.ForceScheduledRestart("managed activation bootstrap");
                 break;
 
             case "prepare" when args.Length == 13:
@@ -130,8 +129,8 @@ internal sealed partial class OpsCommand : CommandBase
                     args[1],
                     args[2],
                     RequiredLong(args[3], "expected revision")).GetAwaiter().GetResult();
-                message = "repaired checkpoint adopted; starting a fresh game session";
-                Core.LocalAdmin.Singleton!.ForceScheduledRestart("managed activation recovery adoption");
+                // The game was never stopped, so adoption only records the repaired checkpoint.
+                message = "repaired checkpoint adopted; the running game keeps its session (restart to load repaired files)";
                 break;
 
             case "probe" when args.Length == 1:
