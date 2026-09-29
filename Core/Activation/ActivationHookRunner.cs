@@ -24,6 +24,11 @@ internal interface IActivationHookRunner
 internal sealed class ActivationHookRunner : IActivationHookRunner
 {
     private const int MaximumOutputCharacters = 64 * 1024;
+
+    // File phases run while the game is stopped or while the command reader waits, so they get a
+    // short fixed budget instead of the readiness window. Runtime verification keeps the window.
+    private static readonly TimeSpan FilePhaseTimeout = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan KillWaitTimeout = TimeSpan.FromSeconds(5);
     private readonly string _cliPath;
 
     internal ActivationHookRunner(string cliPath)
@@ -65,7 +70,9 @@ internal sealed class ActivationHookRunner : IActivationHookRunner
             throw new ActivationProtocolException($"Failed to start scpsl-ops hook '{phase}'.");
 
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeout.CancelAfter(TimeSpan.FromSeconds(Math.Max(30, record.Readiness.TimeoutSeconds)));
+        timeout.CancelAfter(phase == "verify-runtime"
+            ? TimeSpan.FromSeconds(Math.Max(30, record.Readiness.TimeoutSeconds))
+            : FilePhaseTimeout);
 
         var stdoutTask = ReadBoundedAsync(process.StandardOutput, process, timeout.Token);
         var stderrTask = ReadBoundedAsync(process.StandardError, process, timeout.Token);
@@ -157,7 +164,10 @@ internal sealed class ActivationHookRunner : IActivationHookRunner
         try
         {
             if (!process.HasExited)
-                await process.WaitForExitAsync().ConfigureAwait(false);
+            {
+                using var wait = new CancellationTokenSource(KillWaitTimeout);
+                await process.WaitForExitAsync(wait.Token).ConfigureAwait(false);
+            }
         }
         catch
         {

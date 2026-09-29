@@ -10,6 +10,7 @@ internal sealed class ForceRestartCommand : CommandBase
     {
         var localAdmin = Core.LocalAdmin.Singleton!;
         localAdmin.ClaimExitAction(Core.LocalAdmin.ShutdownAction.Restart);
+        localAdmin.CommitPendingActivationForRestart();
         localAdmin.Exit(0, restart: true);
     }
 }

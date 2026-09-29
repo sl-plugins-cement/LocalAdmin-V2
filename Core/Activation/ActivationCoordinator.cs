@@ -91,14 +91,8 @@ internal sealed class ActivationCoordinator
                     return new(true, record.LastError ?? "Recovery is required.", record);
 
                 case ActivationStates.Cancelled:
-                {
-                    var result = await RunHookSafeAsync("cleanup", record, cancellationToken).ConfigureAwait(false);
-                    if (!result.Ok)
-                        return new(true, result.Error ?? "Staging cleanup failed; lane remains cancelled and locked.", record);
-
-                    record = await _store.UpdateAsync(record.Revision, current => ClearOpenActivation(current!, current!.CurrentCheckpoint!), cancellationToken).ConfigureAwait(false);
-                    continue;
-                }
+                    // Nothing was applied; the staging cleanup runs once the game is up.
+                    return new(false, "Cancelled activation cleanup runs after the game starts.", record);
 
                 case ActivationStates.RolledBack:
                     record = await _store.UpdateAsync(record.Revision, current => ClearOpenActivation(current!, current!.PreviousCheckpoint!), cancellationToken).ConfigureAwait(false);
@@ -162,6 +156,21 @@ internal sealed class ActivationCoordinator
         if (record.State == ActivationStates.Pending)
         {
             ArmPending(record);
+            return;
+        }
+
+        if (record.State == ActivationStates.Cancelled)
+        {
+            var cleanupToken = _sessionCts.Token;
+            _ = Task.Run(async () =>
+            {
+                try { await CleanupCancelledAsync(record, cleanupToken).ConfigureAwait(false); }
+                catch (OperationCanceledException) when (cleanupToken.IsCancellationRequested) { }
+                catch (Exception ex)
+                {
+                    ConsoleUtil.WriteLine($"Cancelled activation cleanup failed; the lane stays cancelled: {ex.Message}", ConsoleColor.Yellow);
+                }
+            }, cleanupToken);
             return;
         }
 
@@ -401,6 +410,18 @@ internal sealed class ActivationCoordinator
         _restartIntents.StopForSessionEnd();
         if (disarmNativeRnr && _host.DisarmNativeRestartNextRoundIfOwned())
             ConsoleUtil.WriteLine("Native restart-next-round armed by LocalAdmin was disarmed.", ConsoleColor.Gray);
+    }
+
+    private async Task CleanupCancelledAsync(ActivationRecord record, CancellationToken cancellationToken)
+    {
+        var result = await RunHookSafeAsync("cleanup", record, cancellationToken).ConfigureAwait(false);
+        if (!result.Ok)
+        {
+            ConsoleUtil.WriteLine($"Staging cleanup failed; the lane stays cancelled and locked: {result.Error}", ConsoleColor.Yellow);
+            return;
+        }
+
+        await _store.UpdateAsync(record.Revision, current => ClearOpenActivation(current!, current!.CurrentCheckpoint!), cancellationToken).ConfigureAwait(false);
     }
 
     internal async Task<ActivationRecord> AdoptRecoveryAsync(

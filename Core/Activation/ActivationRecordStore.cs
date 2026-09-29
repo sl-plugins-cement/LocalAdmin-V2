@@ -30,6 +30,9 @@ internal sealed partial class ActivationRecordStore
 {
     private const int MaximumProtocolVersion = 2;
     private static readonly TimeSpan LockTimeout = TimeSpan.FromSeconds(5);
+    // Store access runs on lifecycle paths (session start, round edges, child exit), so waiting
+    // for another in-process user is bounded too; a stuck store fails the call, not the server.
+    private static readonly TimeSpan ProcessLockTimeout = TimeSpan.FromSeconds(10);
     private readonly SemaphoreSlim _processLock = new(1, 1);
 
     [GeneratedRegex(@"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:/[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$", RegexOptions.CultureInvariant)]
@@ -63,7 +66,7 @@ internal sealed partial class ActivationRecordStore
 
     internal async Task<ActivationRecord?> LoadAsync(CancellationToken cancellationToken = default)
     {
-        await _processLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await EnterProcessLockAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(RecordPath)!);
@@ -84,7 +87,7 @@ internal sealed partial class ActivationRecordStore
         Func<ActivationRecord?, ActivationRecord> update,
         CancellationToken cancellationToken = default)
     {
-        await _processLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await EnterProcessLockAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(RecordPath)!);
@@ -385,9 +388,16 @@ internal sealed partial class ActivationRecordStore
         }
     }
 
+    private async Task EnterProcessLockAsync(CancellationToken cancellationToken)
+    {
+        if (!await _processLock.WaitAsync(ProcessLockTimeout, cancellationToken).ConfigureAwait(false))
+            throw new ActivationProtocolException("Timed out waiting for the activation record store.");
+    }
+
     private async Task<FileStream> AcquireFileLockAsync(CancellationToken cancellationToken)
     {
-        var deadline = DateTime.UtcNow + LockTimeout;
+        // Monotonic, so a wall-clock step cannot stretch the wait.
+        var elapsed = System.Diagnostics.Stopwatch.StartNew();
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -395,7 +405,7 @@ internal sealed partial class ActivationRecordStore
             {
                 return new FileStream(LockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
             }
-            catch (IOException) when (DateTime.UtcNow < deadline)
+            catch (IOException) when (elapsed.Elapsed < LockTimeout)
             {
                 await Task.Delay(25, cancellationToken).ConfigureAwait(false);
             }

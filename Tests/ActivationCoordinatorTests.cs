@@ -422,6 +422,30 @@ public sealed class ActivationCoordinatorTests : IDisposable
     }
 
     [Fact]
+    public async Task Cancelled_Cleanup_Runs_After_The_Game_Starts()
+    {
+        var setup = await SetupNextRoundAsync();
+        await setup.Coordinator.OnChildStartedAsync();
+        var pending = (await setup.Store.LoadAsync())!;
+        setup.Hooks.FailCleanup = true;
+        Assert.Equal(ActivationStates.Cancelled, (await setup.Coordinator.CancelAsync(pending.ActivationId)).State);
+        setup.Coordinator.StopForSessionEnd();
+        setup.Hooks.FailCleanup = false;
+        setup.Hooks.Phases.Clear();
+
+        var next = new ActivationCoordinator(setup.Store, setup.Hooks, setup.Host, setup.Tracker);
+        var resume = await next.ResumeBeforeChildAsync();
+        Assert.False(resume.NeedsRepair);
+        Assert.DoesNotContain("cleanup", setup.Hooks.Phases);
+
+        await next.OnChildStartedAsync();
+        var released = await WaitForStateAsync(setup.Store, ActivationStates.Verified);
+        Assert.Null(released.Lock);
+        Assert.Contains("cleanup", setup.Hooks.Phases);
+        next.StopForSessionEnd();
+    }
+
+    [Fact]
     public async Task Pending_Replacement_Preserves_Intent_And_Next_Round_Activates_New_Batch()
     {
         var setup = await SetupNextRoundAsync();

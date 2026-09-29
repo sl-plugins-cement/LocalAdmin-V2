@@ -206,11 +206,15 @@ ops_cli_path: /usr/local/bin/scpsl-ops
 ```
 
 `ops_state_root` and `ops_cli_path` must be absolute. The default state root is
-`/var/lib/scpsl-ops` on Linux and `C:\ProgramData\scpsl-ops` on Windows. Managed activation never
-keeps the game from starting. A missing record (first setup), a malformed or unsupported record, or
-an invalid ops configuration is reported as needing repair, and the game starts with the files on
-disk. LabAPI skips any plugin that fails to load. `scpsl-ops` bootstraps the initial verified record
-while the game runs.
+`/var/lib/scpsl-ops` on Linux and `C:\ProgramData\scpsl-ops` on Windows. Managed activation must
+never leave the server worse off than stock LocalAdmin. It never keeps the game from starting or
+stops a running game on its own: a missing record (first setup), a malformed or unsupported record,
+an invalid ops configuration, or any store or hook error is reported as needing repair, and the game
+starts with the files on disk. LabAPI skips any plugin that fails to load. The only restarts it
+causes are the activation edge an operator queued and one rollback restart of a candidate that
+failed readiness. File hooks that run while the game is stopped get 60 seconds each; staging
+cleanup runs after the game starts. `scpsl-ops` bootstraps the initial verified record while the
+game runs.
 
 The record lives at `lanes/<host>/<lane>/activation.json` below the state root. LocalAdmin writes a
 complete temporary file, flushes it, and atomically replaces the record. Every write checks and
@@ -222,11 +226,15 @@ listener, and a correlated `players` response. The probe accepts a valid zero-pl
 never has two `players` requests in flight. The runtime hook adds managed-file, loader, and server
 verification checks.
 
-If the candidate fails, LocalAdmin restores the previous checkpoint once. If the previous
-checkpoint also fails readiness, the record enters `recovery-required` with the lock and evidence
-intact, and the game keeps running on the previous checkpoint. There is no rollback loop and no
-further restart. A child that dies is relaunched by the normal crash handling. After repair,
-`scpsl-ops recovery adopt` records the repaired checkpoint without restarting the game.
+If the candidate fails, LocalAdmin restores the previous checkpoint once. Only an unplanned child
+exit counts as a failure: a shutdown or restart chosen by an operator or the game keeps its action,
+and verification resumes in the next session. If the previous checkpoint also fails readiness, or
+the rollback files cannot be applied, the record enters `recovery-required` with the lock and
+evidence intact, and the game keeps running on whatever is installed. There is no rollback loop and
+no further restart. A child that dies is relaunched by the normal crash handling. After repair,
+`scpsl-ops recovery adopt` records the repaired checkpoint without restarting the game. A forced
+restart (`restart`, `forcerestart`, or the stalled-restart fallback) applies a queued activation
+instead of leaving it for a second restart.
 
 ### Restart edges of a pending activation
 

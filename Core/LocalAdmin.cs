@@ -583,11 +583,25 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost, IActivationHo
             // Fresh per-session player-count state, then arm the restart-when-empty watchdog.
             _playerProbe.ResetSession();
             _playerTracker.Reset();
+            // Managed activation is best-effort around the session: an unreadable store, a failed
+            // write or a hook error is reported and the game still starts. An exception escaping
+            // Start would dispose this session and kill the child it just launched.
             ActivationResumeResult? activationResume = null;
             if (_activation != null)
-                activationResume = await _activation.ResumeBeforeChildAsync().ConfigureAwait(false);
+            {
+                try
+                {
+                    activationResume = await _activation.ResumeBeforeChildAsync().ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    activationResume = new ActivationResumeResult(true, "Managed activation resume failed: " + ex.Message, null);
+                }
+            }
             else if (_activationInitializationError != null)
+            {
                 activationResume = new ActivationResumeResult(true, _activationInitializationError, null);
+            }
 
             StartRestartWhenEmptyPolicy();
 
@@ -602,7 +616,16 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost, IActivationHo
 
             StartSession();
             if (_activation != null)
-                await _activation.OnChildStartedAsync().ConfigureAwait(false);
+            {
+                try
+                {
+                    await _activation.OnChildStartedAsync().ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    ConsoleUtil.WriteLine($"Managed activation could not attach to this session; the game keeps running: {ex.Message}", ConsoleColor.Red);
+                }
+            }
 
             if (autoEula)
                 ConsoleUtil.WriteLine("SCP: Secret Laboratory EULA (https://link.scpslgame.com/eula) was accepted by providing a startup argument or setting an environment variable.", ConsoleColor.Yellow);
@@ -1034,7 +1057,10 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost, IActivationHo
 
                 try
                 {
-                    if (_activation?.OnChildExitedAsync().GetAwaiter().GetResult() is true)
+                    // Only an unplanned exit is readiness evidence. A shutdown or restart chosen by an
+                    // operator or by the game keeps its action; the activation resumes next session.
+                    if (ExitAction == ShutdownAction.Crash &&
+                        _activation?.OnChildExitedAsync().GetAwaiter().GetResult() is true)
                         ClaimExitAction(ShutdownAction.Restart);
                 }
                 catch (Exception ex)
@@ -1326,6 +1352,12 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost, IActivationHo
         if (!RequestScheduledRestart(reason) || ExitAction != ShutdownAction.Restart)
             return false;
 
+        ArmRestartFallback(reason);
+        return true;
+    }
+
+    private void ArmRestartFallback(string reason)
+    {
         _ = Task.Run(async () =>
         {
             try
@@ -1338,8 +1370,6 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost, IActivationHo
             }
             catch { /* fallback is best-effort; never surface */ }
         });
-
-        return true;
     }
 
     /// <summary>
@@ -1367,8 +1397,14 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost, IActivationHo
             if (!commitActivation())
                 return false;
 
-            return RequestScheduledRestart(reason) && ExitAction == ShutdownAction.Restart;
+            if (!RequestScheduledRestart(reason) || ExitAction != ShutdownAction.Restart)
+                return false;
         }
+
+        // Like any scheduled restart, a stalled native sequence is forced after the fallback delay
+        // instead of leaving the session claimed with the activation half-committed.
+        ArmRestartFallback(reason);
+        return true;
     }
 
     /// <summary>Re-arms a one-shot restart intent carried over from a previous in-process session.</summary>
@@ -1473,8 +1509,27 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost, IActivationHo
             ConsoleUtil.WriteLine($"Scheduled restart fallback forcing game process termination ({reason}).", ConsoleColor.Yellow);
         }
 
+        CommitPendingActivationForRestart();
         Exit(0, restart: true);
         return true;
+    }
+
+    /// <summary>
+    /// A forced restart is the edge a queued next-round/immediate activation waits for. Commit it
+    /// now so the relaunch applies it, instead of re-arming it for a second restart later.
+    /// Best-effort: the restart never depends on the record write.
+    /// </summary>
+    internal void CommitPendingActivationForRestart()
+    {
+        try
+        {
+            if (_activation?.CommitPendingForRestartExitAsync().GetAwaiter().GetResult() is true)
+                ConsoleUtil.WriteLine("This restart applies the pending managed activation on relaunch.", ConsoleColor.Cyan);
+        }
+        catch (Exception ex)
+        {
+            ConsoleUtil.WriteLine($"Could not commit the pending managed activation for this restart: {ex.Message}", ConsoleColor.Yellow);
+        }
     }
 
     private void ClaimHeartbeatRestart()
