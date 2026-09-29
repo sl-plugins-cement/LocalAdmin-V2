@@ -22,7 +22,13 @@ internal interface IActivationHost : IRestartHost
     bool HeartbeatMonitoringAvailable { get; }
 
     bool StartupHeartbeatReady { get; }
-    bool IsGameUdpPortBound();
+
+    /// <summary>
+    /// Whether the game port has a UDP listener, or null with a short reason when the listener
+    /// table could not be read.
+    /// </summary>
+    bool? IsGameUdpPortBound(out string? unavailableReason);
+
     Task<PlayerProbeResult> ProbePlayersAsync(TimeSpan timeout, CancellationToken cancellationToken);
     bool TryScheduleManagedActivationRestart(string reason, Func<bool> commitActivation);
     void ForceActivationSessionRestart(string reason);
@@ -652,10 +658,20 @@ internal sealed class ActivationCoordinator
                 continue;
             }
 
-            if (initial.Readiness.RequireUdp && !_host.IsGameUdpPortBound())
+            // Each poll acts on its own read of the UDP listener table. An unreadable table is no
+            // evidence and does not hold that poll back; a readable table without the listener keeps
+            // readiness waiting, even after an earlier unreadable poll.
+            string? udpUnavailableReason = null;
+            if (initial.Readiness.RequireUdp)
             {
-                await Task.Delay(500, cancellationToken).ConfigureAwait(false);
-                continue;
+                var udpBound = _host.IsGameUdpPortBound(out var reason);
+                if (udpBound == false)
+                {
+                    await Task.Delay(500, cancellationToken).ConfigureAwait(false);
+                    continue;
+                }
+                if (udpBound == null)
+                    udpUnavailableReason = string.IsNullOrWhiteSpace(reason) ? "unknown error" : reason;
             }
 
             try
@@ -682,7 +698,12 @@ internal sealed class ActivationCoordinator
                         "advisory: LocalAdmin heartbeat monitoring is disabled, so readiness did not wait for a heartbeat"));
             }
             if (initial.Readiness.RequireUdp)
-                checks.Add(Check(target + ".udp", true, "configured UDP listener is bound"));
+            {
+                checks.Add(udpUnavailableReason == null
+                    ? Check(target + ".udp", true, "configured UDP listener is bound")
+                    : Check(target + ".udp", true,
+                        $"advisory: the UDP listener table could not be read ({udpUnavailableReason})"));
+            }
 
             var latest = await _store.LoadAsync(cancellationToken).ConfigureAwait(false)
                          ?? throw new ActivationProtocolException("activation.json disappeared during readiness.");

@@ -224,9 +224,11 @@ or `rolling-back` from that file.
 Readiness requires the child process, console connection, configured heartbeat, configured UDP
 listener, and a correlated `players` response. When LocalAdmin's heartbeat monitoring is disabled
 (`enable_heartbeat: false` or `hbctrl disable`), readiness does not wait for a heartbeat it cannot
-observe and records a passing advisory `startup-heartbeat` check instead. The probe accepts a valid
-zero-player response and never has two `players` requests in flight. The runtime hook adds
-managed-file, loader, and server verification checks.
+observe and records a passing advisory `startup-heartbeat` check instead. When a poll cannot read
+the UDP listener table, readiness does not wait on it and records a passing advisory `udp` check
+with the reason; only a readable table without the listener keeps readiness waiting. The probe
+accepts a valid zero-player response and never has two `players` requests in flight. The runtime
+hook adds managed-file, loader, and server verification checks.
 
 LocalAdmin rolls a candidate back only on evidence: an unplanned child exit during readiness, no
 readiness answer before the deadline while monitoring works, or a `verify-runtime` result with at

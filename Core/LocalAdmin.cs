@@ -1630,22 +1630,34 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost, IActivationHo
     bool IActivationHost.StartupHeartbeatReady =>
         EnableGameHeartbeat && CurrentHeartbeatStatus == HeartbeatStatus.Active;
 
-    bool IActivationHost.IsGameUdpPortBound() => IsGameUdpPortBound();
+    bool? IActivationHost.IsGameUdpPortBound(out string? unavailableReason) => IsGameUdpPortBound(out unavailableReason);
 
     void IActivationHost.ForceActivationSessionRestart(string reason) => ForceScheduledRestart(reason);
 
-    private static bool IsGameUdpPortBound()
+    // A failed read is reported as unobservable, never as "not bound": readiness must not treat a
+    // broken observer as evidence against a healthy game.
+    private static bool? IsGameUdpPortBound(out string? unavailableReason)
     {
         try
         {
+            unavailableReason = null;
             return System.Net.NetworkInformation.IPGlobalProperties.GetIPGlobalProperties()
                 .GetActiveUdpListeners()
                 .Any(endpoint => endpoint.Port == GamePort);
         }
-        catch
+        catch (Exception ex)
         {
-            return false;
+            unavailableReason = DescribeUnavailableObservation(ex);
+            return null;
         }
+    }
+
+    private static string DescribeUnavailableObservation(Exception ex)
+    {
+        const int maxLength = 120;
+        var message = ex.Message.Split('\n', 2)[0].Trim();
+        var reason = message.Length == 0 ? ex.GetType().Name : $"{ex.GetType().Name}: {message}";
+        return reason.Length <= maxLength ? reason : reason[..(maxLength - 3)] + "...";
     }
 
     private void ConfigureManagedActivation()

@@ -256,6 +256,39 @@ public sealed class ActivationCoordinatorTests : IDisposable
     }
 
     [Fact]
+    public async Task Required_Udp_Is_Advisory_When_The_Listener_Table_Cannot_Be_Read()
+    {
+        var readiness = ActivationRecordStoreTests.Readiness() with { TimeoutSeconds = 1 };
+        var setup = await SetupActivatingAsync(readiness: readiness);
+        setup.Host.UdpPortBound = null;
+        await setup.Coordinator.ResumeBeforeChildAsync();
+        await setup.Coordinator.OnChildStartedAsync();
+
+        var verified = await WaitForStateAsync(setup.Store, ActivationStates.Verified);
+        Assert.Equal(Pending, verified.CurrentCheckpoint);
+        Assert.False(verified.RollbackAttempted);
+        Assert.Equal(0, setup.Host.ForcedRestarts);
+        var udp = Assert.Single(verified.Checks, check => check.Name == "pending.udp");
+        Assert.True(udp.Ok);
+        Assert.StartsWith("advisory: the UDP listener table could not be read (", udp.Detail);
+    }
+
+    [Fact]
+    public async Task Unbound_Udp_Port_While_The_Table_Is_Readable_Fails_Readiness()
+    {
+        var readiness = ActivationRecordStoreTests.Readiness() with { TimeoutSeconds = 1 };
+        var setup = await SetupActivatingAsync(readiness: readiness);
+        setup.Host.UdpPortBound = false;
+        await setup.Coordinator.ResumeBeforeChildAsync();
+        await setup.Coordinator.OnChildStartedAsync();
+
+        var rollingBack = await WaitForStateAsync(setup.Store, ActivationStates.RollingBack);
+        Assert.Equal("readiness deadline expired", rollingBack.LastError);
+        Assert.DoesNotContain("verify-runtime", setup.Hooks.Phases);
+        await WaitUntilAsync(() => setup.Host.ForcedRestarts == 1);
+    }
+
+    [Fact]
     public async Task Runtime_Hook_Timeout_Keeps_Candidate_Verifying_And_Retries()
     {
         var readiness = ActivationRecordStoreTests.Readiness() with { TimeoutSeconds = 1 };
@@ -756,7 +789,13 @@ public sealed class ActivationCoordinatorTests : IDisposable
         }
         public void RequestPlayerCountRefresh() { }
         public bool ConfirmNotShuttingDown() => true;
-        public bool IsGameUdpPortBound() => true;
+        /// <summary>Null simulates an unreadable UDP listener table.</summary>
+        internal bool? UdpPortBound = true;
+        public bool? IsGameUdpPortBound(out string? unavailableReason)
+        {
+            unavailableReason = UdpPortBound == null ? "NetworkInformationException: access denied" : null;
+            return UdpPortBound;
+        }
         public async Task<PlayerProbeResult> ProbePlayersAsync(TimeSpan timeout, CancellationToken cancellationToken)
         {
             if (BlockProbe)
