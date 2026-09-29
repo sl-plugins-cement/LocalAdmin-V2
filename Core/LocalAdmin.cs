@@ -1623,6 +1623,10 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost, IActivationHo
 
     bool IActivationHost.GameConsoleConnected => Server is { Connected: true };
 
+    // hbctrl can disable monitoring for the session; HandleHeartbeat then ignores every heartbeat.
+    bool IActivationHost.HeartbeatMonitoringAvailable =>
+        EnableGameHeartbeat && CurrentHeartbeatStatus != HeartbeatStatus.Disabled;
+
     bool IActivationHost.StartupHeartbeatReady =>
         EnableGameHeartbeat && CurrentHeartbeatStatus == HeartbeatStatus.Active;
 

@@ -211,8 +211,8 @@ never leave the server worse off than stock LocalAdmin. It never keeps the game 
 stops a running game on its own: a missing record (first setup), a malformed or unsupported record,
 an invalid ops configuration, or any store or hook error is reported as needing repair, and the game
 starts with the files on disk. LabAPI skips any plugin that fails to load. The only restarts it
-causes are the activation edge an operator queued and one rollback restart of a candidate that
-failed readiness. File hooks that run while the game is stopped get 60 seconds each; staging
+causes are the activation edge an operator queued and one rollback restart of a candidate with
+evidence of failure. File hooks that run while the game is stopped get 60 seconds each; staging
 cleanup runs after the game starts. `scpsl-ops` bootstraps the initial verified record while the
 game runs.
 
@@ -222,16 +222,30 @@ increments the record revision. A LocalAdmin restart resumes `pending`, `activat
 or `rolling-back` from that file.
 
 Readiness requires the child process, console connection, configured heartbeat, configured UDP
-listener, and a correlated `players` response. The probe accepts a valid zero-player response and
-never has two `players` requests in flight. The runtime hook adds managed-file, loader, and server
-verification checks.
+listener, and a correlated `players` response. When LocalAdmin's heartbeat monitoring is disabled
+(`enable_heartbeat: false` or `hbctrl disable`), readiness does not wait for a heartbeat it cannot
+observe and records a passing advisory `startup-heartbeat` check instead. The probe accepts a valid
+zero-player response and never has two `players` requests in flight. The runtime hook adds
+managed-file, loader, and server verification checks.
 
-If the candidate fails, LocalAdmin restores the previous checkpoint once. Only an unplanned child
-exit counts as a failure: a shutdown or restart chosen by an operator or the game keeps its action,
-and verification resumes in the next session. If the previous checkpoint also fails readiness, or
-the rollback files cannot be applied, the record enters `recovery-required` with the lock and
-evidence intact, and the game keeps running on whatever is installed. There is no rollback loop and
-no further restart. A child that dies is relaunched by the normal crash handling. After repair,
+LocalAdmin rolls a candidate back only on evidence: an unplanned child exit during readiness, no
+readiness answer before the deadline while monitoring works, or a `verify-runtime` result with at
+least one failed check. It then restores the previous checkpoint once. A shutdown or restart chosen
+by an operator or the game keeps its action, and verification resumes in the next session.
+
+A verification tooling failure is not evidence. When `verify-runtime` cannot start, times out,
+crashes, answers invalid or mismatched JSON, or fails without a failed check (for example checkpoint
+finalization on a full disk, or a missing server-verification proof), nothing is restarted or rolled
+back: the candidate keeps running, the record stays `verifying`, LocalAdmin logs a red line, and a
+later crash follows the normal crash handling. Verification retries every 60 seconds for up to 30
+minutes, each attempt with a fresh readiness deadline; a retry rolls back only on a failed check. A
+successful retry records `verified`. If the retries run out, the record stays `verifying` and the
+next session (the next game restart) verifies again.
+
+If the previous checkpoint also fails readiness or cannot be verified, or the rollback files cannot
+be applied, the record enters `recovery-required` with the lock and evidence intact, and the game
+keeps running on whatever is installed. There is no rollback loop and no further restart. A child
+that dies is relaunched by the normal crash handling. After repair,
 `scpsl-ops recovery adopt` records the repaired checkpoint without restarting the game. A forced
 restart (`restart`, `forcerestart`, or the stalled-restart fallback) applies a queued activation
 instead of leaving it for a second restart.

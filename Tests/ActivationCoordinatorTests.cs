@@ -137,15 +137,78 @@ public sealed class ActivationCoordinatorTests : IDisposable
     }
 
     [Fact]
-    public async Task Required_Server_Verification_Must_Be_Proved_By_Runtime_Hook()
+    public async Task Failed_Runtime_Check_Rolls_The_Candidate_Back_Once()
     {
+        var setup = await SetupActivatingAsync();
+        setup.Hooks.VerifyPendingOk = false;
+        await setup.Coordinator.ResumeBeforeChildAsync();
+        await setup.Coordinator.OnChildStartedAsync();
+
+        var rollingBack = await WaitForStateAsync(setup.Store, ActivationStates.RollingBack);
+        Assert.Equal("simulated readiness failure", rollingBack.LastError);
+        Assert.Contains(rollingBack.Checks, check => check is { Name: "runtime.loader-log", Ok: false });
+        await WaitUntilAsync(() => setup.Host.ForcedRestarts == 1);
+    }
+
+    [Fact]
+    public async Task Unproved_Server_Verification_Keeps_Candidate_Verifying_Without_Rollback()
+    {
+        // Ok=true without the required proof is no failed check: the candidate is neither
+        // finalized nor rolled back, and verification keeps retrying.
         var setup = await SetupActivatingAsync();
         setup.Hooks.IncludeVerificationProof = false;
         await setup.Coordinator.ResumeBeforeChildAsync();
         await setup.Coordinator.OnChildStartedAsync();
 
-        var rollingBack = await WaitForStateAsync(setup.Store, ActivationStates.RollingBack);
-        Assert.Contains("did not prove", rollingBack.LastError);
+        await WaitUntilAsync(() => setup.Hooks.VerifyCalls >= 2);
+        setup.Coordinator.StopForSessionEnd();
+        Assert.Equal(ActivationStates.Verifying, (await setup.Store.LoadAsync())!.State);
+        Assert.Equal(0, setup.Host.ForcedRestarts);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Runtime_Hook_Tool_Failure_Keeps_Candidate_Running_Until_A_Retry_Verifies(bool hookThrows)
+    {
+        var setup = await SetupActivatingAsync();
+        setup.Hooks.ToolFailures = 1;
+        setup.Hooks.ToolFailureThrows = hookThrows;
+        setup.Hooks.RetryRelease = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        await setup.Coordinator.ResumeBeforeChildAsync();
+        await setup.Coordinator.OnChildStartedAsync();
+        await setup.Hooks.RetryStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // The candidate stays installed; a crash now follows ordinary crash handling.
+        Assert.Equal(ActivationStates.Verifying, (await setup.Store.LoadAsync())!.State);
+        Assert.False(await setup.Coordinator.OnChildExitedAsync());
+        Assert.Equal(ActivationStates.Verifying, (await setup.Store.LoadAsync())!.State);
+
+        setup.Hooks.RetryRelease.TrySetResult();
+        var verified = await WaitForStateAsync(setup.Store, ActivationStates.Verified);
+        Assert.Equal(Pending, verified.CurrentCheckpoint);
+        Assert.Equal(0, setup.Host.ForcedRestarts);
+        Assert.DoesNotContain("apply-rollback", setup.Hooks.Phases);
+        setup.Coordinator.StopForSessionEnd();
+    }
+
+    [Fact]
+    public async Task Rollback_Target_Tool_Failure_Enters_Recovery_Naming_The_Tooling()
+    {
+        var setup = await SetupActivatingAsync();
+        setup.Hooks.VerifyPendingOk = false;
+        await setup.Coordinator.ResumeBeforeChildAsync();
+        await setup.Coordinator.OnChildStartedAsync();
+        await WaitForStateAsync(setup.Store, ActivationStates.RollingBack);
+
+        setup.Hooks.ToolFailures = setup.Hooks.VerifyCalls + 1;
+        var rollbackCoordinator = new ActivationCoordinator(setup.Store, setup.Hooks, setup.Host, setup.Tracker);
+        await rollbackCoordinator.ResumeBeforeChildAsync();
+        await rollbackCoordinator.OnChildStartedAsync();
+
+        var recovery = await WaitForStateAsync(setup.Store, ActivationStates.RecoveryRequired);
+        Assert.Contains("verification tooling failed; the game keeps running", recovery.LastError);
+        Assert.Equal(1, setup.Host.ForcedRestarts);
     }
 
     [Fact]
@@ -162,7 +225,7 @@ public sealed class ActivationCoordinatorTests : IDisposable
     }
 
     [Fact]
-    public async Task Required_Heartbeat_Does_Not_Pass_When_Monitoring_Is_Unavailable()
+    public async Task Missing_Heartbeat_While_Monitoring_Works_Fails_Readiness()
     {
         var readiness = ActivationRecordStoreTests.Readiness() with { TimeoutSeconds = 1 };
         var setup = await SetupActivatingAsync(readiness: readiness);
@@ -176,7 +239,24 @@ public sealed class ActivationCoordinatorTests : IDisposable
     }
 
     [Fact]
-    public async Task Runtime_Hook_Is_Bounded_By_Total_Readiness_Deadline()
+    public async Task Required_Heartbeat_Is_Advisory_When_Heartbeat_Monitoring_Is_Disabled()
+    {
+        var readiness = ActivationRecordStoreTests.Readiness() with { TimeoutSeconds = 1 };
+        var setup = await SetupActivatingAsync(readiness: readiness);
+        setup.Host.HeartbeatMonitoringAvailable = false;
+        setup.Host.StartupHeartbeatReady = false;
+        await setup.Coordinator.ResumeBeforeChildAsync();
+        await setup.Coordinator.OnChildStartedAsync();
+
+        var verified = await WaitForStateAsync(setup.Store, ActivationStates.Verified);
+        Assert.Equal(Pending, verified.CurrentCheckpoint);
+        var heartbeat = Assert.Single(verified.Checks, check => check.Name == "pending.startup-heartbeat");
+        Assert.True(heartbeat.Ok);
+        Assert.StartsWith("advisory:", heartbeat.Detail);
+    }
+
+    [Fact]
+    public async Task Runtime_Hook_Timeout_Keeps_Candidate_Verifying_And_Retries()
     {
         var readiness = ActivationRecordStoreTests.Readiness() with { TimeoutSeconds = 1 };
         var setup = await SetupActivatingAsync(readiness: readiness);
@@ -185,9 +265,15 @@ public sealed class ActivationCoordinatorTests : IDisposable
         var started = DateTime.UtcNow;
         await setup.Coordinator.OnChildStartedAsync();
 
-        var rollingBack = await WaitForStateAsync(setup.Store, ActivationStates.RollingBack);
+        // The first hook is cut off at the readiness deadline, then retried with a fresh one.
+        await WaitUntilAsync(() => setup.Hooks.VerifyCalls >= 2);
         Assert.True(DateTime.UtcNow - started < TimeSpan.FromSeconds(3));
-        Assert.Equal("readiness deadline expired", rollingBack.LastError);
+        Assert.Equal(ActivationStates.Verifying, (await setup.Store.LoadAsync())!.State);
+        Assert.Equal(0, setup.Host.ForcedRestarts);
+
+        setup.Hooks.VerificationDelay = TimeSpan.Zero;
+        Assert.Equal(Pending, (await WaitForStateAsync(setup.Store, ActivationStates.Verified)).CurrentCheckpoint);
+        setup.Coordinator.StopForSessionEnd();
     }
 
     [Fact]
@@ -242,7 +328,10 @@ public sealed class ActivationCoordinatorTests : IDisposable
         var host = new FakeHost();
         var hooks = new FakeHooks();
         var tracker = new PlayerCountTracker();
-        var coordinator = new ActivationCoordinator(store, hooks, host, tracker);
+        var coordinator = new ActivationCoordinator(store, hooks, host, tracker)
+        {
+            VerificationRetryInterval = TimeSpan.FromMilliseconds(50)
+        };
         var bootstrap = await coordinator.BootstrapAsync(
             "58f83dc3-bf19-4a45-89f6-f7138142b4db",
             Current,
@@ -272,7 +361,7 @@ public sealed class ActivationCoordinatorTests : IDisposable
 
     private static async Task<ActivationRecord> WaitForStateAsync(ActivationRecordStore store, string state)
     {
-        for (var i = 0; i < 200; i++)
+        for (var i = 0; i < 500; i++)
         {
             var record = await store.LoadAsync();
             if (record?.State == state)
@@ -280,6 +369,13 @@ public sealed class ActivationCoordinatorTests : IDisposable
             await Task.Delay(10);
         }
         throw new TimeoutException($"Activation record did not enter {state}.");
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        for (var i = 0; i < 500 && !condition(); i++)
+            await Task.Delay(10);
+        Assert.True(condition());
     }
 
     [Fact]
@@ -546,12 +642,37 @@ public sealed class ActivationCoordinatorTests : IDisposable
         internal bool FailPreflight;
         internal TimeSpan VerificationDelay;
 
+        // The first ToolFailures verify-runtime calls fail without evidence: they throw like a
+        // hook that cannot run, or answer Ok=false with only passing checks.
+        internal int ToolFailures;
+        internal bool ToolFailureThrows = true;
+        internal int VerifyCalls;
+        internal TaskCompletionSource RetryStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal TaskCompletionSource? RetryRelease;
+
         public async Task<ActivationHookResult> RunAsync(string phase, ActivationRecord record, CancellationToken cancellationToken)
         {
             lock (Phases)
                 Phases.Add(phase);
-            if (phase == "verify-runtime" && VerificationDelay > TimeSpan.Zero)
-                await Task.Delay(VerificationDelay, cancellationToken);
+            if (phase == "verify-runtime")
+            {
+                var call = Interlocked.Increment(ref VerifyCalls);
+                if (call <= ToolFailures)
+                {
+                    if (ToolFailureThrows)
+                        throw new ActivationProtocolException("scpsl-ops hook 'verify-runtime' exited 1 with invalid JSON");
+                    return Result(record, phase, false, null, new() { FakeCheck("runtime.loader-log", true) },
+                        "checkpoint finalization failed: no space left on device");
+                }
+                if (ToolFailures > 0 && call == ToolFailures + 1)
+                {
+                    RetryStarted.TrySetResult();
+                    if (RetryRelease is not null)
+                        await RetryRelease.Task.WaitAsync(cancellationToken);
+                }
+                if (VerificationDelay > TimeSpan.Zero)
+                    await Task.Delay(VerificationDelay, cancellationToken);
+            }
             if (phase == "preflight-replacement" && BeforeReplacement is not null) await BeforeReplacement();
             var isPrevious = record.VerificationTarget == "previous" || phase == "apply-rollback";
             var ok = phase switch
@@ -562,30 +683,38 @@ public sealed class ActivationCoordinatorTests : IDisposable
                 "verify-runtime" => isPrevious ? VerifyPreviousOk : VerifyPendingOk,
                 _ => true
             };
-            return new ActivationHookResult
-            {
-                ProtocolVersion = 1,
-                Ok = ok,
-                ActivationId = record.ActivationId,
-                Phase = phase,
-                Checkpoint = !ok && NullCheckpointOnFailure
+            // Like scpsl-ops, a failed runtime verification reports the check that failed.
+            var checks = phase != "verify-runtime" ? new List<ActivationCheck>()
+                : !ok ? new List<ActivationCheck> { FakeCheck("runtime.loader-log", false) }
+                : IncludeVerificationProof ? new List<ActivationCheck> { FakeCheck("runtime.verification-token", true) }
+                : new List<ActivationCheck>();
+            return Result(record, phase, ok,
+                !ok && NullCheckpointOnFailure
                     ? null
                     : isPrevious ? record.PreviousCheckpoint : record.PendingCheckpoint,
-                Checks = phase == "verify-runtime" && ok && IncludeVerificationProof
-                    ? new List<ActivationCheck>
-                    {
-                        new()
-                        {
-                            Name = "runtime.verification-token",
-                            Ok = true,
-                            ObservedAt = ActivationRecordStore.FormatTimestamp(DateTime.UtcNow),
-                            Detail = "verification token remains present"
-                        }
-                    }
-                    : new(),
-                Error = ok ? null : "simulated readiness failure"
-            };
+                checks,
+                ok ? null : "simulated readiness failure");
         }
+
+        private static ActivationHookResult Result(ActivationRecord record, string phase, bool ok,
+            string? checkpoint, List<ActivationCheck> checks, string? error) => new()
+        {
+            ProtocolVersion = 1,
+            Ok = ok,
+            ActivationId = record.ActivationId,
+            Phase = phase,
+            Checkpoint = checkpoint,
+            Checks = checks,
+            Error = error
+        };
+
+        private static ActivationCheck FakeCheck(string name, bool ok) => new()
+        {
+            Name = name,
+            Ok = ok,
+            ObservedAt = ActivationRecordStore.FormatTimestamp(DateTime.UtcNow),
+            Detail = ok ? "simulated passing check" : "simulated failed check"
+        };
     }
 
     private sealed class FakeHost : IActivationHost
@@ -610,6 +739,7 @@ public sealed class ActivationCoordinatorTests : IDisposable
         internal TaskCompletionSource ProbeRelease { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public bool GameProcessRunning => true;
         public bool GameConsoleConnected => true;
+        public bool HeartbeatMonitoringAvailable { get; set; } = true;
         public bool StartupHeartbeatReady { get; set; } = true;
         public bool IsShuttingDown => false;
         public bool RestartInProgress => false;

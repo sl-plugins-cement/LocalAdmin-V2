@@ -3,6 +3,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Net.NetworkInformation;
 using System.Threading;
@@ -16,6 +17,10 @@ internal interface IActivationHost : IRestartHost
 {
     bool GameProcessRunning { get; }
     bool GameConsoleConnected { get; }
+
+    /// <summary>False when LocalAdmin's heartbeat monitoring is disabled, so no heartbeat can be observed.</summary>
+    bool HeartbeatMonitoringAvailable { get; }
+
     bool StartupHeartbeatReady { get; }
     bool IsGameUdpPortBound();
     Task<PlayerProbeResult> ProbePlayersAsync(TimeSpan timeout, CancellationToken cancellationToken);
@@ -41,7 +46,8 @@ internal sealed record ActivationResumeResult(bool NeedsRepair, string Message, 
 /// Durable activation state machine. It supervises the game and invokes fixed scpsl-ops hooks; it
 /// never interprets checkpoint manifests or writes managed game files itself.
 /// It never keeps the game stopped: LabAPI already skips a plugin that fails to load, so a failed
-/// check or an unreadable record is reported for repair while the server keeps serving.
+/// check or an unreadable record is reported for repair while the server keeps serving. A candidate
+/// is rolled back only on evidence against it, never because the verification tooling failed.
 /// </summary>
 internal sealed class ActivationCoordinator
 {
@@ -52,7 +58,10 @@ internal sealed class ActivationCoordinator
     private readonly RestartIntentManager _restartIntents = new();
     private readonly CancellationTokenSource _sessionCts = new();
     private int _verificationRunning;
-    private string? _runningVerificationTarget;
+
+    // The target this session's child is under verification for. Cleared when the tooling fails,
+    // so a later crash follows ordinary crash handling instead of rolling the candidate back.
+    private volatile string? _runningVerificationTarget;
 
     internal ActivationCoordinator(
         ActivationRecordStore store,
@@ -67,6 +76,11 @@ internal sealed class ActivationCoordinator
     }
 
     internal ActivationRecordStore Store => _store;
+
+    // A candidate the tooling could not verify keeps running and is verified again on this
+    // schedule, each attempt with a fresh readiness deadline.
+    internal TimeSpan VerificationRetryInterval { get; init; } = TimeSpan.FromSeconds(60);
+    internal TimeSpan VerificationRetryWindow { get; init; } = TimeSpan.FromMinutes(30);
 
     internal async Task<ActivationResumeResult> ResumeBeforeChildAsync(CancellationToken cancellationToken = default)
     {
@@ -181,7 +195,7 @@ internal sealed class ActivationCoordinator
             var verificationToken = _sessionCts.Token;
             _ = Task.Run(async () =>
             {
-                try { await VerifyRunningChildAsync(record, verificationToken).ConfigureAwait(false); }
+                try { await SuperviseVerificationAsync(record, verificationToken).ConfigureAwait(false); }
                 catch (OperationCanceledException) when (verificationToken.IsCancellationRequested) { }
                 catch (Exception ex)
                 {
@@ -522,7 +536,94 @@ internal sealed class ActivationCoordinator
             ConsoleUtil.WriteLine(message, ConsoleColor.DarkGreen);
     }
 
-    private async Task VerifyRunningChildAsync(ActivationRecord initial, CancellationToken cancellationToken)
+    /// <summary>
+    /// Verifies this session's child. When the verification tooling, not the game, fails for a
+    /// candidate, the candidate keeps running in <c>verifying</c> and is verified again on the
+    /// retry schedule; a later LocalAdmin session starts over if the retries run out.
+    /// </summary>
+    private async Task SuperviseVerificationAsync(ActivationRecord initial, CancellationToken cancellationToken)
+    {
+        if (initial.State == ActivationStates.RollingBack)
+        {
+            await VerifyRunningChildAsync(initial, attended: true, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        var error = await TryVerifyCandidateAsync(initial, attended: true, cancellationToken).ConfigureAwait(false);
+        if (error == null)
+            return;
+
+        _runningVerificationTarget = null;
+        var schedule = $"every {VerificationRetryInterval.TotalSeconds:0.#} s for up to {VerificationRetryWindow.TotalMinutes:0.#} min";
+        ConsoleUtil.WriteLine(
+            $"Managed activation could not verify the candidate ({error}). This is a verification tooling failure, not evidence against the deployment: " +
+            $"the game keeps running on the candidate, nothing is rolled back, and the record stays verifying. Retrying {schedule}.",
+            ConsoleColor.Red);
+
+        var retrying = Stopwatch.StartNew();
+        for (var attempt = 1; retrying.Elapsed + VerificationRetryInterval <= VerificationRetryWindow; attempt++)
+        {
+            await Task.Delay(VerificationRetryInterval, cancellationToken).ConfigureAwait(false);
+            error = await TryVerifyCandidateAsync(initial, attended: false, cancellationToken).ConfigureAwait(false);
+            if (error == null)
+                return;
+            ConsoleUtil.WriteLine($"Managed activation verification retry {attempt} could not verify the candidate ({error}).", ConsoleColor.Yellow);
+        }
+
+        ConsoleUtil.WriteLine(
+            $"Managed activation is still unverified after retrying {schedule} ({error}). The record stays verifying and the game keeps running; " +
+            "the next LocalAdmin session verifies it again.",
+            ConsoleColor.Red);
+    }
+
+    /// <summary>
+    /// Runs one candidate attempt and contains every tooling error. Returns null when the attempt
+    /// reached a decision or the record moved on, otherwise why the candidate is still unverified.
+    /// </summary>
+    private async Task<string?> TryVerifyCandidateAsync(ActivationRecord initial, bool attended, CancellationToken cancellationToken)
+    {
+        string? error;
+        try
+        {
+            error = await VerifyRunningChildAsync(initial, attended, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+        {
+            error = ex.Message;
+        }
+
+        // A decision made meanwhile (a child-exit rollback, an operator repair) or the end of this
+        // session wins; the next session verifies again.
+        return error != null && !_host.IsShuttingDown &&
+               await StillVerifyingAsync(initial.ActivationId, cancellationToken).ConfigureAwait(false)
+            ? error
+            : null;
+    }
+
+    private async Task<bool> StillVerifyingAsync(string activationId, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var latest = await _store.LoadAsync(cancellationToken).ConfigureAwait(false);
+            return latest != null && IsExpectedVerification(latest, activationId, "pending");
+        }
+        catch (Exception) when (!cancellationToken.IsCancellationRequested)
+        {
+            // An unreadable store is reported and retried rather than silently dropped.
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// One readiness and runtime-verification attempt. Only evidence fails the target: an
+    /// unplanned child exit, no readiness answer before the deadline while monitoring works, or a
+    /// runtime check that failed. Returns null once the attempt reached a decision or the record
+    /// moved on, otherwise why the tooling could not verify the candidate.
+    /// </summary>
+    /// <param name="attended">This session's child is under verification. A retry after a tooling
+    /// failure is not: a child exit is left to ordinary crash handling, a readiness timeout is
+    /// retried, and only a failed runtime check rolls the candidate back.</param>
+    private async Task<string?> VerifyRunningChildAsync(ActivationRecord initial, bool attended, CancellationToken cancellationToken)
     {
         var target = initial.State == ActivationStates.RollingBack ? "previous" : "pending";
         var deadline = DateTime.UtcNow.AddSeconds(initial.Readiness.TimeoutSeconds);
@@ -532,8 +633,9 @@ internal sealed class ActivationCoordinator
         {
             if (!_host.GameProcessRunning)
             {
-                await FailReadinessAsync(initial, target, checks, "game process exited during readiness", cancellationToken).ConfigureAwait(false);
-                return;
+                if (attended)
+                    await FailReadinessAsync(initial, target, checks, "game process exited during readiness", cancellationToken).ConfigureAwait(false);
+                return null;
             }
 
             if (!_host.GameConsoleConnected)
@@ -542,7 +644,9 @@ internal sealed class ActivationCoordinator
                 continue;
             }
 
-            if (initial.Readiness.RequireHeartbeat && !_host.StartupHeartbeatReady)
+            // Waiting for a heartbeat LocalAdmin cannot observe would fail a healthy game at the deadline.
+            var heartbeatObservable = _host.HeartbeatMonitoringAvailable;
+            if (initial.Readiness.RequireHeartbeat && heartbeatObservable && !_host.StartupHeartbeatReady)
             {
                 await Task.Delay(500, cancellationToken).ConfigureAwait(false);
                 continue;
@@ -571,35 +675,35 @@ internal sealed class ActivationCoordinator
             checks.Add(Check(target + ".process", true, "game process is running"));
             checks.Add(Check(target + ".console", true, "game console is connected"));
             if (initial.Readiness.RequireHeartbeat)
-                checks.Add(Check(target + ".startup-heartbeat", true, "startup heartbeat observed"));
+            {
+                checks.Add(heartbeatObservable
+                    ? Check(target + ".startup-heartbeat", true, "startup heartbeat observed")
+                    : Check(target + ".startup-heartbeat", true,
+                        "advisory: LocalAdmin heartbeat monitoring is disabled, so readiness did not wait for a heartbeat"));
+            }
             if (initial.Readiness.RequireUdp)
                 checks.Add(Check(target + ".udp", true, "configured UDP listener is bound"));
 
             var latest = await _store.LoadAsync(cancellationToken).ConfigureAwait(false)
                          ?? throw new ActivationProtocolException("activation.json disappeared during readiness.");
             if (!IsExpectedVerification(latest, initial.ActivationId, target))
-                return;
+                return null;
             latest = await _store.UpdateAsync(latest.Revision, record => record! with
             {
                 Checks = Append(record.Checks, checks)
             }, cancellationToken).ConfigureAwait(false);
 
+            // The game answered readiness, so from here on only a failed runtime check is evidence.
             var remainingForHook = deadline - DateTime.UtcNow;
             if (remainingForHook <= TimeSpan.Zero)
-            {
-                await FailReadinessAsync(latest, target, Array.Empty<ActivationCheck>(), "readiness deadline expired", cancellationToken).ConfigureAwait(false);
-                return;
-            }
+                return await VerificationUnconfirmedAsync(latest, target, "no readiness time was left to run verify-runtime", cancellationToken).ConfigureAwait(false);
 
             using var hookDeadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             hookDeadline.CancelAfter(remainingForHook);
             var hook = await RunHookSafeAsync("verify-runtime", latest, hookDeadline.Token).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
-            if (hookDeadline.IsCancellationRequested || DateTime.UtcNow >= deadline)
-            {
-                await FailReadinessAsync(latest, target, hook.Checks, "readiness deadline expired", cancellationToken).ConfigureAwait(false);
-                return;
-            }
+            if (!hook.Ok && hook.Checks.Count == 0 && hookDeadline.IsCancellationRequested)
+                hook = hook with { Error = "verify-runtime did not answer before the readiness deadline" };
 
             if (hook.Ok && initial.Readiness.RequireVerification && !HasSuccessfulServerVerification(hook.Checks))
             {
@@ -611,8 +715,8 @@ internal sealed class ActivationCoordinator
             }
 
             // A FAILED verify-runtime returns no finalized checkpoint. The staged candidate must
-            // stay in pending_checkpoint so the record remains valid and the failure converts
-            // into the single rollback instead of crashing this verification task.
+            // stay in pending_checkpoint so the record remains valid for the single rollback or a
+            // retry instead of crashing this verification task.
             latest = await _store.UpdateAsync(latest.Revision, record => record! with
             {
                 PendingCheckpoint = target == "pending" && hook.Ok && hook.Checkpoint != null
@@ -626,8 +730,14 @@ internal sealed class ActivationCoordinator
 
             if (!hook.Ok)
             {
-                await FailReadinessAsync(latest, target, Array.Empty<ActivationCheck>(), hook.Error ?? "runtime verification failed", cancellationToken).ConfigureAwait(false);
-                return;
+                // A hook that could not run or answer, or that stopped without failing a check
+                // (checkpoint finalization on a full disk, config bookkeeping, a missing proof),
+                // produced no evidence against the target.
+                var error = hook.Error ?? "runtime verification failed";
+                if (!hook.Checks.Any(check => !check.Ok))
+                    return await VerificationUnconfirmedAsync(latest, target, error, cancellationToken).ConfigureAwait(false);
+                await FailReadinessAsync(latest, target, Array.Empty<ActivationCheck>(), error, cancellationToken).ConfigureAwait(false);
+                return null;
             }
 
             if (target == "pending")
@@ -646,12 +756,19 @@ internal sealed class ActivationCoordinator
                 await _store.UpdateAsync(rolledBack.Revision, record => ClearOpenActivation(record!, record!.PreviousCheckpoint!), cancellationToken).ConfigureAwait(false);
                 ConsoleUtil.WriteLine("Previous checkpoint verified after automatic rollback.", ConsoleColor.DarkGreen);
             }
-            return;
+            return null;
         }
 
+        // LocalAdmin is ending the session (an operator exit or restart); the next session verifies again.
+        if (_host.IsShuttingDown)
+            return null;
+        if (!attended)
+            return "the game did not answer readiness before the deadline";
         await FailReadinessAsync(initial, target, checks, "readiness deadline expired", cancellationToken).ConfigureAwait(false);
+        return null;
     }
 
+    /// <summary>The target produced evidence of failure.</summary>
     private async Task FailReadinessAsync(
         ActivationRecord stale,
         string target,
@@ -659,34 +776,73 @@ internal sealed class ActivationCoordinator
         string error,
         CancellationToken cancellationToken)
     {
-        var latest = await _store.LoadAsync(cancellationToken).ConfigureAwait(false) ?? stale;
-        if (!string.Equals(latest.ActivationId, stale.ActivationId, StringComparison.Ordinal))
-            return;
-        if (latest.State == ActivationStates.Verified)
-            return;
-        if (target == "pending")
+        if (target == "previous")
         {
-            if (latest.State == ActivationStates.Verifying)
-                await EnterRollbackAsync(latest, error, checks, cancellationToken).ConfigureAwait(false);
-            else if (latest.State is not (ActivationStates.RollingBack or ActivationStates.RecoveryRequired or ActivationStates.Verified))
-                throw new ActivationProtocolException($"Cannot fail pending readiness from state {latest.State}.");
-
-            _host.ForceActivationSessionRestart("managed activation readiness failed; restoring the previous checkpoint");
+            await RecoverRollbackTargetAsync(stale, checks, "rollback target failed readiness; the game keeps running: " + error, cancellationToken).ConfigureAwait(false);
             return;
         }
 
-        // The rollback target is the last known-good build. Restarting it again cannot help, so
-        // the running game is left alone: a plugin that failed to load is already skipped by
-        // LabAPI, and a dead child is relaunched by LocalAdmin's normal crash handling.
+        var latest = await LoadOpenAsync(stale, cancellationToken).ConfigureAwait(false);
+        if (latest == null)
+            return;
+        if (latest.State == ActivationStates.Verifying)
+            await EnterRollbackAsync(latest, error, checks, cancellationToken).ConfigureAwait(false);
+        else if (latest.State is not (ActivationStates.RollingBack or ActivationStates.RecoveryRequired))
+            throw new ActivationProtocolException($"Cannot fail pending readiness from state {latest.State}.");
+
+        _host.ForceActivationSessionRestart("managed activation readiness failed; restoring the previous checkpoint");
+    }
+
+    /// <summary>
+    /// The verification tooling could not decide the target, which is no evidence against it. A
+    /// candidate stays installed and verifying and the reason is returned for a retry; the rollback
+    /// target keeps its recovery-required handling with a message that names the tooling.
+    /// </summary>
+    private async Task<string?> VerificationUnconfirmedAsync(
+        ActivationRecord stale,
+        string target,
+        string error,
+        CancellationToken cancellationToken)
+    {
+        if (target == "pending")
+            return error;
+        await RecoverRollbackTargetAsync(stale, Array.Empty<ActivationCheck>(),
+            "rollback target could not be verified because the verification tooling failed; the game keeps running: " + error,
+            cancellationToken).ConfigureAwait(false);
+        return null;
+    }
+
+    // The rollback target is the last known-good build. Restarting it again cannot help, so the
+    // running game is left alone: a plugin that failed to load is already skipped by LabAPI, and a
+    // dead child is relaunched by LocalAdmin's normal crash handling.
+    private async Task RecoverRollbackTargetAsync(
+        ActivationRecord stale,
+        IReadOnlyCollection<ActivationCheck> checks,
+        string error,
+        CancellationToken cancellationToken)
+    {
+        var latest = await LoadOpenAsync(stale, cancellationToken).ConfigureAwait(false);
+        if (latest == null)
+            return;
         if (latest.State == ActivationStates.RollingBack)
         {
-            await EnterRecoveryAsync(latest, "rollback target failed readiness; the game keeps running: " + error, checks, cancellationToken).ConfigureAwait(false);
+            await EnterRecoveryAsync(latest, error, checks, cancellationToken).ConfigureAwait(false);
             ConsoleUtil.WriteLine("Managed activation needs repair (recovery-required); the game keeps running.", ConsoleColor.Red);
         }
-        else if (latest.State is not (ActivationStates.RecoveryRequired or ActivationStates.Verified))
+        else if (latest.State != ActivationStates.RecoveryRequired)
         {
             throw new ActivationProtocolException($"Cannot fail rollback readiness from state {latest.State}.");
         }
+    }
+
+    /// <summary>The current record of <paramref name="stale"/>'s activation, or null once it was verified or replaced.</summary>
+    private async Task<ActivationRecord?> LoadOpenAsync(ActivationRecord stale, CancellationToken cancellationToken)
+    {
+        var latest = await _store.LoadAsync(cancellationToken).ConfigureAwait(false) ?? stale;
+        return string.Equals(latest.ActivationId, stale.ActivationId, StringComparison.Ordinal) &&
+               latest.State != ActivationStates.Verified
+            ? latest
+            : null;
     }
 
     private async Task<ActivationRecord> EnterRollbackAsync(
