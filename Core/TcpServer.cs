@@ -1,5 +1,7 @@
 using System;
 using System.Buffers;
+using System.Buffers.Binary;
+using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
@@ -64,128 +66,150 @@ public class TcpServer
                 _client.SendBufferSize = LocalAdmin.Configuration.LaToSlBufferSize;
 
                 _txBuffer = LocalAdmin.Configuration.LaToSlBufferSize;
+                var maxMessageLength = LocalAdmin.Configuration.SlToLaBufferSize;
+                var bigEndianLengths = LocalAdmin.Configuration.SlToLaBigEndianLength;
 
                 _networkStream = _client.GetStream();
                 Connected = true;
 
+                var stream = _networkStream;
+
                 Task.Run(async () =>
                 {
-                    const int offset = sizeof(int);
                     var codeBuffer = new byte[1];
-                    var lengthBuffer = new byte[offset];
+                    var lengthBuffer = new byte[sizeof(int)];
                     var restartReceived = false;
 
                     while (true)
                     {
-                        await Task.Delay(10);
-
                         lock (_lck)
                         {
                             if (_exit)
                                 break;
                         }
 
-                        if (_networkStream?.DataAvailable != true)
-                            continue;
-
-                        int readAmount = await _networkStream.ReadAsync(codeBuffer.AsMemory(0, 1));
-
-                        if (readAmount == 0)
-                            continue;
-
-                        if (codeBuffer[0] < 16)
+                        try
                         {
-                            readAmount = await _networkStream.ReadAsync(lengthBuffer.AsMemory(0, offset));
-
-                            if (readAmount < 4)
+                            if (await stream.ReadAsync(codeBuffer.AsMemory(0, 1)) == 0)
                             {
-                                Received?.Invoke(this,
-                                    "4[LocalAdmin] Received **INVALID** data message length. Length: " + readAmount);
-                                continue;
+                                // Normal on every game exit; the process watcher handles the restart.
+                                Received?.Invoke(this, "7[LocalAdmin] The game closed the console connection.");
+                                break;
                             }
 
-                            var length = MemoryMarshal.Cast<byte, int>(lengthBuffer)[0];
-                            var buffer = ArrayPool<byte>.Shared.Rent(length);
-
-                            while (_client.Available < length)
-                                await Task.Delay(20);
-
-                            readAmount = await _networkStream.ReadAsync(buffer.AsMemory(0, length));
-
-                            if (readAmount != length)
+                            if (codeBuffer[0] < 16)
                             {
-                                Received?.Invoke(this,
-                                    $"4[LocalAdmin] Received **INVALID** data message. Length received: {readAmount}. Length expected: {length}.");
-                                continue;
-                            }
+                                await stream.ReadExactlyAsync(lengthBuffer);
 
-                            var message = $"{codeBuffer[0]:X}{_encoding.GetString(buffer, 0, length)}";
-                            ArrayPool<byte>.Shared.Return(buffer);
+                                var length = bigEndianLengths
+                                    ? BinaryPrimitives.ReadInt32BigEndian(lengthBuffer)
+                                    : BinaryPrimitives.ReadInt32LittleEndian(lengthBuffer);
 
-                            Received?.Invoke(this, message);
-                        }
-                        else
-                        {
-                            // Ignore control bytes once this TcpServer is no longer the active
-                            // session's server (an in-process restart created a new session/server).
-                            // Otherwise a late byte from the old connection could seed the new
-                            // session's player tracker or round-restart counter.
-                            if (!ReferenceEquals(LocalAdmin.Singleton?.Server, this))
-                                continue;
-
-                            if (LocalAdmin.PrintControlMessages)
-                                Received?.Invoke(this, "7[LocalAdmin] Received control message: " + codeBuffer[0]);
-
-                            switch ((OutputCodes)codeBuffer[0])
-                            {
-                                case OutputCodes.RoundRestart:
-                                    if (restartReceived)
-                                        Logger.Initialize();
-                                    else restartReceived = true;
-                                    LocalAdmin.Singleton?.NotifyRoundRestart();
+                                // Every later byte would be parsed out of step, so there is no safe way to resume.
+                                if (length < 0 || length > maxMessageLength)
+                                {
+                                    ReportReadStopped(
+                                        $"received a data message length of {length}, outside 0-{maxMessageLength}. If the game frames lengths with the other byte order, toggle sl_to_la_big_endian_length.");
                                     break;
+                                }
 
-                                case OutputCodes.IdleEnter:
-                                    LocalAdmin.Singleton?.SetIdleModeState(true);
-                                    LocalAdmin.Singleton?.NotifyIdleEnter();
-                                    break;
+                                var buffer = ArrayPool<byte>.Shared.Rent(length);
+                                string text;
 
-                                case OutputCodes.IdleExit:
-                                    LocalAdmin.Singleton?.SetIdleModeState(false);
-                                    LocalAdmin.Singleton?.NotifyIdleExit();
-                                    break;
-
-                                case OutputCodes.ExitActionReset:
-                                    LocalAdmin.Singleton!.TryApplyGameExitAction(LocalAdmin.ShutdownAction.Crash);
-                                    break;
-
-                                case OutputCodes.ExitActionShutdown:
-                                    LocalAdmin.Singleton!.TryApplyGameExitAction(LocalAdmin.ShutdownAction.Shutdown);
-                                    break;
-
-                                case OutputCodes.ExitActionSilentShutdown:
-                                    LocalAdmin.Singleton!.TryApplyGameExitAction(LocalAdmin.ShutdownAction.SilentShutdown);
-                                    break;
-
-                                case OutputCodes.ExitActionRestart:
-                                    LocalAdmin.Singleton!.TryApplyGameExitAction(LocalAdmin.ShutdownAction.Restart);
-                                    break;
-
-                                case OutputCodes.Heartbeat:
-                                    LocalAdmin.Singleton!.HandleHeartbeat();
-                                    break;
-
-                                default:
+                                try
+                                {
+                                    await stream.ReadExactlyAsync(buffer.AsMemory(0, length));
+                                    text = _encoding.GetString(buffer, 0, length);
+                                }
+                                catch (DecoderFallbackException)
+                                {
                                     Received?.Invoke(this,
-                                        "4[LocalAdmin] Received **INVALID** control message: " + codeBuffer[0]);
+                                        $"4[LocalAdmin] Received a data message that is not valid UTF-8 ({length} bytes).");
+                                    continue;
+                                }
+                                finally
+                                {
+                                    ArrayPool<byte>.Shared.Return(buffer);
+                                }
+
+                                Received?.Invoke(this, $"{codeBuffer[0]:X}{text}");
+                                continue;
+                            }
+                        }
+                        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+                        {
+                            lock (_lck)
+                            {
+                                if (_exit)
                                     break;
                             }
+
+                            ReportReadStopped("the console connection failed: " + ex.Message);
+                            break;
+                        }
+
+                        // Ignore control bytes once this TcpServer is no longer the active
+                        // session's server (an in-process restart created a new session/server).
+                        // Otherwise a late byte from the old connection could seed the new
+                        // session's player tracker or round-restart counter.
+                        if (!ReferenceEquals(LocalAdmin.Singleton?.Server, this))
+                            continue;
+
+                        if (LocalAdmin.PrintControlMessages)
+                            Received?.Invoke(this, "7[LocalAdmin] Received control message: " + codeBuffer[0]);
+
+                        switch ((OutputCodes)codeBuffer[0])
+                        {
+                            case OutputCodes.RoundRestart:
+                                if (restartReceived)
+                                    Logger.Initialize();
+                                else restartReceived = true;
+                                LocalAdmin.Singleton?.NotifyRoundRestart();
+                                break;
+
+                            case OutputCodes.IdleEnter:
+                                LocalAdmin.Singleton?.SetIdleModeState(true);
+                                LocalAdmin.Singleton?.NotifyIdleEnter();
+                                break;
+
+                            case OutputCodes.IdleExit:
+                                LocalAdmin.Singleton?.SetIdleModeState(false);
+                                LocalAdmin.Singleton?.NotifyIdleExit();
+                                break;
+
+                            case OutputCodes.ExitActionReset:
+                                LocalAdmin.Singleton!.TryApplyGameExitAction(LocalAdmin.ShutdownAction.Crash);
+                                break;
+
+                            case OutputCodes.ExitActionShutdown:
+                                LocalAdmin.Singleton!.TryApplyGameExitAction(LocalAdmin.ShutdownAction.Shutdown);
+                                break;
+
+                            case OutputCodes.ExitActionSilentShutdown:
+                                LocalAdmin.Singleton!.TryApplyGameExitAction(LocalAdmin.ShutdownAction.SilentShutdown);
+                                break;
+
+                            case OutputCodes.ExitActionRestart:
+                                LocalAdmin.Singleton!.TryApplyGameExitAction(LocalAdmin.ShutdownAction.Restart);
+                                break;
+
+                            case OutputCodes.Heartbeat:
+                                LocalAdmin.Singleton!.HandleHeartbeat();
+                                break;
+
+                            default:
+                                Received?.Invoke(this,
+                                    "4[LocalAdmin] Received **INVALID** control message: " + codeBuffer[0]);
+                                break;
                         }
                     }
                 });
             }, _listener);
         }
     }
+
+    private void ReportReadStopped(string reason) =>
+        Received?.Invoke(this, "4[LocalAdmin] Stopped reading game output: " + reason);
 
     public void Stop()
     {

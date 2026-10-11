@@ -23,6 +23,7 @@ public sealed class ConfigTests
         var cfg = new Config
         {
             CommandChannelEnabled = true,
+            SlToLaBigEndianLength = true,
             AutoRestartEmptyEnabled = true,
             RestartAtOrBelowPlayers = 2,
             EmptyConfirmations = 3,
@@ -39,6 +40,7 @@ public sealed class ConfigTests
         var roundTripped = Config.DeserializeConfig(cfg.SerializeConfig().Split('\n'));
 
         Assert.True(roundTripped.CommandChannelEnabled);
+        Assert.True(roundTripped.SlToLaBigEndianLength);
         Assert.True(roundTripped.AutoRestartEmptyEnabled);
         Assert.Equal(2, roundTripped.RestartAtOrBelowPlayers);
         Assert.Equal(3, roundTripped.EmptyConfirmations);

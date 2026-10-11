@@ -40,6 +40,15 @@ If `server_application_path` is empty, LocalAdmin tries:
 
 When a server executable is found, LocalAdmin uses that executable's directory as the game working directory.
 
+To run a game build that frames its console output with big-endian lengths, such as Carl Mod, point
+`server_application_path` at its executable (for example `Carl Mod.exe`) and set:
+
+```text
+sl_to_la_big_endian_length: true
+```
+
+With the wrong setting LocalAdmin reports an out-of-range message length and stops reading game output.
+
 ## Headless command channel
 
 Enable the named-pipe command channel in the LocalAdmin config:

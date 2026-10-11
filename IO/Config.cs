@@ -30,6 +30,8 @@ public class Config
 
     public int LaToSlBufferSize = 25000;
     public int SlToLaBufferSize = 200000;
+    // Some game builds, such as Carl Mod, frame their console output with big-endian lengths.
+    public bool SlToLaBigEndianLength;
 
     // Enhanced fork additions: headless command channel + restart-when-empty.
     public bool CommandChannelEnabled;
@@ -127,6 +129,9 @@ public class Config
 
         sb.Append("sl_to_la_buffer_size: ");
         sb.AppendLine(SlToLaBufferSize.ToString());
+
+        sb.Append("sl_to_la_big_endian_length: ");
+        sb.AppendLine(SlToLaBigEndianLength.ToString().ToLowerInvariant());
 
         sb.Append("command_channel_enabled: ");
         sb.AppendLine(CommandChannelEnabled.ToString().ToLowerInvariant());
@@ -285,6 +290,10 @@ public class Config
                     cfg.SlToLaBufferSize = b;
                     break;
 
+                case "sl_to_la_big_endian_length" when bool.TryParse(sp[1], out var b):
+                    cfg.SlToLaBigEndianLength = b;
+                    break;
+
                 case "command_channel_enabled" when bool.TryParse(sp[1], out var b):
                     cfg.CommandChannelEnabled = b;
                     break;
@@ -424,6 +433,9 @@ public class Config
         sb.AppendLine(string.IsNullOrWhiteSpace(ServerApplicationPath)
             ? "- Server application path is not configured; LocalAdmin will auto-discover it."
             : $"- Server application path is configured as: {ServerApplicationPath}");
+
+        if (SlToLaBigEndianLength)
+            sb.AppendLine("- Game output message lengths are read as big-endian.");
 
         sb.AppendLine(!UsesManagedActivation
             ? $"- Managed activation is DISABLED; typed command lane: {OpsLane}."
