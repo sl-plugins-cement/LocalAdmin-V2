@@ -83,6 +83,8 @@ The LocalAdmin executable includes a native cross-platform client, so a Linux ho
 
 `raw`, `console`, `local`, and `localadmin` are equivalent exact-text modes. The mode may be omitted (`./LocalAdmin ctl 7777 players`). `ra` is the convenience mode and does not add a second slash when the command already starts with one. Run `./LocalAdmin ctl --help` for pipe-name and timeout options.
 
+`playercount` is a quiet LocalAdmin command for status pollers: `./LocalAdmin ctl 7777 localadmin playercount` probes the player list (5 s timeout) and answers with one typed line, `@@SCPSL_OPS_TYPED_V1@@{"operation":"players.count","subject":"<ops_lane>","ok":true,"value":3,"error":null}`. When the game console is not connected or the probe times out, `ok` is `false`, `value` is `null` and `error` gives the reason. The command echo, the reply and the game's `List of players` output go to command-channel clients only and never reach the console window or the LocalAdmin log; a manually typed `players` still prints as usual.
+
 Client exit status describes transport/delivery, not the command's semantic result:
 
 - `0` - LocalAdmin echoed the submitted line, confirming delivery. An RA command can still return a failure response; inspect the printed response.

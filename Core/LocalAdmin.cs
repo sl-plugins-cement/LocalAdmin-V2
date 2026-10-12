@@ -725,6 +725,16 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost, IActivationHo
                 colorValue = (byte)ConsoleColor.Gray;
 
             var stripped = line[1..];
+
+            // The reply to a quiet probe (the `playercount` command) stays off the console and
+            // log, but the tracker still needs the header line to complete the probe.
+            if (_playerProbe.TrySuppressQuietReply(stripped, DateTime.UtcNow, out var quietTrackerLine))
+            {
+                if (quietTrackerLine != null)
+                    OnConsoleLine(quietTrackerLine);
+                return;
+            }
+
             ConsoleUtil.WriteLine(stripped, (ConsoleColor)colorValue);
 
             // Fan out: feed the restart-when-empty tracker and the command-channel read-back.
@@ -843,7 +853,12 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost, IActivationHo
                 if (string.IsNullOrWhiteSpace(input))
                     continue;
 
-                EchoInput(input);
+                // The command-channel client anchors on this echo, so a machine-polled command
+                // keeps it for the channel but not for the console window or the log.
+                if (CommandService.GetCommandByName(input.Split(' ')[0]) is { EchoToChannelOnly: true })
+                    ConsoleUtil.WriteChannelOnly($">>> {input}");
+                else
+                    EchoInput(input);
 
                 if (!_processRefreshFail && _gameProcess != null)
                 {
@@ -1135,6 +1150,7 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost, IActivationHo
         CommandService.RegisterCommand(new HeartbeatControlCommand());
         CommandService.RegisterCommand(new RestartCommand());
         CommandService.RegisterCommand(new RestartWhenCommand());
+        CommandService.RegisterCommand(new PlayerCountCommand());
         CommandService.RegisterCommand(new ForceRestartCommand());
         CommandService.RegisterCommand(new HelpCommand());
         CommandService.RegisterCommand(new LicenseCommand());
@@ -1319,6 +1335,13 @@ public sealed class LocalAdmin : IDisposable, Policy.IRestartHost, IActivationHo
 
     internal Task<PlayerProbeResult> ProbePlayersAsync(TimeSpan timeout, CancellationToken cancellationToken = default)
         => _playerProbe.ProbeAsync(timeout, cancellationToken);
+
+    /// <summary>
+    /// As <see cref="ProbePlayersAsync"/>, but the game's reply to the poll is kept off the console
+    /// and log. A poll another caller already has in flight is shared and keeps its printing.
+    /// </summary>
+    internal Task<PlayerProbeResult> ProbePlayersQuietAsync(TimeSpan timeout, CancellationToken cancellationToken = default)
+        => _playerProbe.ProbeQuietAsync(timeout, cancellationToken);
 
     Task<PlayerProbeResult> IActivationHost.ProbePlayersAsync(TimeSpan timeout, CancellationToken cancellationToken) =>
         ProbePlayersAsync(timeout, cancellationToken);

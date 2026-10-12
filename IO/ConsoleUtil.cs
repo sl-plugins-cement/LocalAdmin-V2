@@ -121,6 +121,19 @@ public static class ConsoleUtil
         catch { /* read-back must never break console output */ }
     }
 
+    /// <summary>
+    /// True when a command-channel client sink is attached, so <see cref="WriteChannelOnly"/> has
+    /// somewhere to go.
+    /// </summary>
+    internal static bool HasChannelSink => OutputSink != null;
+
+    /// <summary>
+    /// Sends a line to command-channel clients only: it is not shown in the console window and is
+    /// not written to the LocalAdmin log. Used by machine-polled commands whose output would
+    /// otherwise grow the log on every poll.
+    /// </summary>
+    internal static void WriteChannelOnly(string content) => MirrorToSink(content);
+
     public static void WriteLine(string? content, ConsoleColor color = ConsoleColor.White, int height = 0, bool log = true, bool display = true)
     {
         lock (Lck)

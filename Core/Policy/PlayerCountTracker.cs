@@ -34,7 +34,7 @@ internal sealed class PlayerCountTracker
     // (player entries follow on separate lines). End-anchored: console lines can embed
     // player-controlled text (a nickname leads the authentication line), so a line that merely
     // STARTS with this shape (e.g. a player named "List of players (0):" joining) must not match.
-    private static readonly Regex PlayersListRegex = new(
+    internal static readonly Regex PlayersListRegex = new(
         @"^\s*List of players \((\d+)\):?\s*$",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 

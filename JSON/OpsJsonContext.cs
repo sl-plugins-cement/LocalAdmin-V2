@@ -12,4 +12,5 @@ namespace LocalAdmin.V2.JSON;
 [JsonSerializable(typeof(ActivationHookResult))]
 [JsonSerializable(typeof(OpsCommandResponse))]
 [JsonSerializable(typeof(RestartWhenTypedResponse))]
+[JsonSerializable(typeof(PlayerCountTypedResponse))]
 internal sealed partial class OpsJsonContext : JsonSerializerContext;

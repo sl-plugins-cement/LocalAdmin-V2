@@ -20,5 +20,11 @@ internal abstract class CommandBase
         SendToGame = sendToGame;
     }
 
+    /// <summary>
+    /// True for machine-polled commands whose input echo goes to command-channel clients only,
+    /// so a poll every few seconds does not grow the console window or the LocalAdmin log.
+    /// </summary>
+    internal virtual bool EchoToChannelOnly => false;
+
     internal abstract void Execute(string[] arguments);
 }
