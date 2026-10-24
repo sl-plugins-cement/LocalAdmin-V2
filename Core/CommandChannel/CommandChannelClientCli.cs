@@ -56,7 +56,7 @@ internal static class CommandChannelClientCli
         var baseName = "LocalAdmin-Console";
         string? pipeNameOverride = null;
         var connectTimeoutMs = 5000;
-        var quietMs = 1500;
+        var quietMs = 0;
         var timeoutMs = 12000;
         var useRa = false;
         var commandStart = -1;
@@ -100,12 +100,31 @@ internal static class CommandChannelClientCli
                 continue;
             }
 
-            if (TryReadPositiveInt(args, ref i, "--quiet-ms", out parsedInt, out error))
+            if (TryReadValue(args, ref i, "--quiet-ms", null, out value))
             {
-                if (error != null)
-                    return false;
+                if (!int.TryParse(value, out parsedInt) || parsedInt < 0)
+                    return Fail("--quiet-ms requires a non-negative integer value.", out options, out error);
                 quietMs = parsedInt;
                 continue;
+            }
+
+            if (TryReadValue(args, ref i, "--commands-file", null, out value))
+            {
+                try
+                {
+                    var lines = File.ReadAllLines(value).Where(line => !string.IsNullOrWhiteSpace(line)).ToArray();
+                    if (port == null || lines.Length is < 1 or > 256 || lines.Any(line => line.Length > 8192))
+                        return Fail("--commands-file needs a preceding port and 1-256 commands of at most 8192 characters.", out options, out error);
+                    options = new CommandChannelClientOptions(port.Value, string.Join('\n', lines), baseName,
+                        pipeNameOverride, connectTimeoutMs, quietMs, timeoutMs);
+                    if (i != args.Count - 1)
+                        return Fail("--commands-file must be the last option.", out options, out error);
+                    return true;
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+                {
+                    return Fail("Could not read commands file: " + ex.Message, out options, out error);
+                }
             }
 
             if (TryReadPositiveInt(args, ref i, "--timeout-ms", out parsedInt, out error))
@@ -245,6 +264,8 @@ internal static class CommandChannelClientCli
         writer.WriteLine("RA mode prepends '/' and uses the game's native Remote Admin command path.");
         writer.WriteLine();
         writer.WriteLine("Options: --base-name <name>, --pipe-name <name>, --connect-timeout-ms <ms>,");
-        writer.WriteLine("         --quiet-ms <ms>, --timeout-ms <ms>");
+        writer.WriteLine("         --quiet-ms <ms>, --timeout-ms <ms>, --commands-file <path> (last option)");
+        writer.WriteLine("Commands run consecutively. Default completion uses a native echo barrier, without a silence delay.");
+        writer.WriteLine("Use --quiet-ms <positive ms> to collect delayed output until quiet instead (0 disables it).");
     }
 }

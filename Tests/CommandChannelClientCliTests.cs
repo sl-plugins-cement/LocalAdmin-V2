@@ -45,6 +45,7 @@ public sealed class CommandChannelClientCliTests
             out _), error);
 
         Assert.Equal("players", options!.Command);
+        Assert.Equal(0, options.QuietMs);
     }
 
     [Theory]
@@ -93,11 +94,26 @@ public sealed class CommandChannelClientCliTests
     [InlineData("7777", "ra")]
     [InlineData("0", "players")]
     [InlineData("--port", "not-a-port", "players")]
-    [InlineData("7777", "--quiet-ms", "0", "players")]
+    [InlineData("7777", "--quiet-ms", "-1", "players")]
     [InlineData("7777", "--quite-ms", "100", "players")]
     public void Rejects_Incomplete_Or_Invalid_Invocations(params string[] args)
     {
         Assert.False(CommandChannelClientCli.TryParse(args, out _, out var error, out _));
         Assert.False(string.IsNullOrWhiteSpace(error));
+    }
+
+    [Fact]
+    public void Commands_File_Preserves_Consecutive_Order()
+    {
+        var path = System.IO.Path.GetTempFileName();
+        try
+        {
+            System.IO.File.WriteAllText(path, "/god 2 enable\n\n/forcerole 3 Tutorial\n");
+            Assert.True(CommandChannelClientCli.TryParse(new[] { "7777", "--commands-file", path },
+                out var options, out var error, out _), error);
+            Assert.Equal("/god 2 enable\n/forcerole 3 Tutorial", options!.Command);
+            Assert.Equal(0, options.QuietMs);
+        }
+        finally { System.IO.File.Delete(path); }
     }
 }

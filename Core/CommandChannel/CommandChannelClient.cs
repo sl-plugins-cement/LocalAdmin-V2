@@ -7,6 +7,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
+using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -66,9 +67,15 @@ internal static class CommandChannelClient
             NewLine = "\n"
         };
 
-        await writer.WriteLineAsync(options.Command).ConfigureAwait(false);
+        var commands = options.Command.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var barrier = "ctl-" + Guid.NewGuid().ToString("N");
+        // One write queues the complete batch in order. The game's native echo is processed
+        // after preceding console commands; it is a dispatch barrier, not gameplay readiness.
+        var payload = options.Command.TrimEnd() + (options.QuietMs == 0 ? "\necho " + barrier : "");
+        await writer.WriteLineAsync(payload).ConfigureAwait(false);
 
-        var echoMarker = ">>> " + options.Command.Trim();
+        var echoMarker = ">>> " + commands[0];
+        var echoes = commands.Select(command => ">>> " + command).ToHashSet(StringComparer.Ordinal);
         var overall = Stopwatch.StartNew();
         var lastActivity = Stopwatch.StartNew();
         var anchored = false;
@@ -78,7 +85,7 @@ internal static class CommandChannelClient
         while (overall.ElapsedMilliseconds < options.TimeoutMs)
         {
             var remainingOverall = options.TimeoutMs - (int)overall.ElapsedMilliseconds;
-            var readBudget = anchored
+            var readBudget = anchored && options.QuietMs > 0
                 ? Math.Min(remainingOverall, Math.Max(1, options.QuietMs - (int)lastActivity.ElapsedMilliseconds))
                 : remainingOverall;
 
@@ -117,6 +124,10 @@ internal static class CommandChannelClient
                 continue;
             }
 
+            if (options.QuietMs == 0 && line.TrimEnd().EndsWith("Echo response: " + barrier, StringComparison.Ordinal))
+                return SuccessExitCode;
+            if (line.Trim() == ">>> echo " + barrier || echoes.Contains(line.Trim()))
+                continue;
             output.WriteLine(line);
             gotReply = true;
         }
@@ -131,10 +142,16 @@ internal static class CommandChannelClient
             return UnconfirmedDeliveryExitCode;
         }
 
-        if (!gotReply)
+        if (!gotReply && options.QuietMs > 0)
         {
             error.WriteLine(
                 $"Command delivery was confirmed, but it produced no output within the {options.QuietMs} ms quiet window.");
+        }
+
+        if (options.QuietMs == 0)
+        {
+            error.WriteLine("Command completion barrier was not received; commands may have run. Do not resubmit mutations blindly. Use --quiet-ms for asynchronous output or commands without a running game.");
+            return UnconfirmedDeliveryExitCode;
         }
 
         return SuccessExitCode;

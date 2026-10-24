@@ -67,7 +67,7 @@ pwsh -File .\client\la-send.ps1 -Port 7777 -Command "players"
 pwsh -File .\client\la-send.ps1 -Port 7777 -Command "help"
 ```
 
-The command channel enqueues the same command text that a console operator would type, then streams recent LocalAdmin console output back to the caller until the reply settles.
+The command channel enqueues the same command text that a console operator would type, then streams console output back to the caller. Commands run consecutively with no inserted delays.
 
 The LocalAdmin executable includes a native cross-platform client, so a Linux host does not need PowerShell or a second runtime:
 
@@ -87,12 +87,12 @@ The LocalAdmin executable includes a native cross-platform client, so a Linux ho
 
 Client exit status describes transport/delivery, not the command's semantic result:
 
-- `0` - LocalAdmin echoed the submitted line, confirming delivery. An RA command can still return a failure response; inspect the printed response.
+- `0` - the ordered completion barrier was received (or the explicitly requested quiet window ended after the command echo). An RA command can still return a failure response; inspect the printed response.
 - `2` - the client could not connect to the pipe.
-- `3` - the pipe connected, but the command echo was not observed before timeout, so delivery is unconfirmed.
+- `3` - command echo or completion was not observed before timeout; commands may have run, so inspect state before retrying mutations.
 - `64` - invalid client syntax.
 
-The read-back protocol captures console output after the matching command echo until the configured quiet window. It does not expose SCP:SL's internal RA boolean result as a process exit code.
+By default the client sends the command followed by a uniquely tagged native `echo`, returning when that echo replies. This confirms preceding console commands were dispatched, not that asynchronous gameplay finished. Agents own waits and readiness checks. Use `--quiet-ms 1500` before the command to collect delayed asynchronous output until silence, or when the game is not connected. `--quiet-ms 0` selects the default fast mode. For a burst, use `ctl <port> --commands-file <UTF-8 path>` (last option): 1–256 non-empty lines are sent in order in one write. The client does not expose SCP:SL's internal RA boolean result as a process exit code.
 
 The pipe is intentionally same-user only. When LocalAdmin runs as a service account, the client must run as that account too. `client/scpsl-ctl` is a POSIX wrapper template that uses non-interactive `sudo` and provides concise SSH automation:
 
