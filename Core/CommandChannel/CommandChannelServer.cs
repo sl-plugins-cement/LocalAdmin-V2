@@ -37,7 +37,7 @@ internal sealed class CommandChannelServer
     // cap inbound line length (so a newline-less stream can't grow memory unbounded), and reap a
     // connection that sends nothing for a long time.
     private const int MaxConcurrentClients = 32;
-    private const int MaxInboundLineLength = 8 * 1024;
+    internal const int MaxInboundLineLength = 64 * 1024;
     private static readonly TimeSpan IdleConnectionTimeout = TimeSpan.FromSeconds(300);
     private static readonly TimeSpan OutputCaptureWindow = TimeSpan.FromSeconds(15);
 

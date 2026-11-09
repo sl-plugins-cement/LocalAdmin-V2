@@ -113,8 +113,8 @@ internal static class CommandChannelClientCli
                 try
                 {
                     var lines = File.ReadAllLines(value).Where(line => !string.IsNullOrWhiteSpace(line)).ToArray();
-                    if (port == null || lines.Length is < 1 or > 256 || lines.Any(line => line.Length > 8192))
-                        return Fail("--commands-file needs a preceding port and 1-256 commands of at most 8192 characters.", out options, out error);
+                    if (port == null || lines.Length is < 1 or > 256 || lines.Any(line => line.Length > CommandChannelServer.MaxInboundLineLength))
+                        return Fail("--commands-file needs a preceding port and 1-256 commands of at most 65536 characters.", out options, out error);
                     options = new CommandChannelClientOptions(port.Value, string.Join('\n', lines), baseName,
                         pipeNameOverride, connectTimeoutMs, quietMs, timeoutMs);
                     if (i != args.Count - 1)
@@ -180,6 +180,9 @@ internal static class CommandChannelClientCli
 
         if (useRa && command[0] != '/')
             command = "/" + command;
+
+        if (command.Split('\n').Any(line => line.Length > CommandChannelServer.MaxInboundLineLength))
+            return Fail("Commands must contain at most 65536 characters per line.", out options, out error);
 
         options = new CommandChannelClientOptions(
             port.Value,

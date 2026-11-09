@@ -116,4 +116,13 @@ public sealed class CommandChannelClientCliTests
         }
         finally { System.IO.File.Delete(path); }
     }
+    [Fact]
+    public void Inline_Command_Length_Is_Checked_After_Ra_Prefixing()
+    {
+        Assert.True(CommandChannelClientCli.TryParse(new[] {"7777", "console", new string('x',65536)}, out _, out _));
+        Assert.False(CommandChannelClientCli.TryParse(new[] {"7777", "console", new string('x',65537)}, out _, out _));
+        Assert.True(CommandChannelClientCli.TryParse(new[] {"7777", "ra", new string('x',65535)}, out _, out _));
+        Assert.False(CommandChannelClientCli.TryParse(new[] {"7777", "ra", new string('x',65536)}, out _, out _));
+    }
+
 }

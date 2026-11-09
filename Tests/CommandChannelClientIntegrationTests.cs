@@ -79,4 +79,34 @@ public sealed class CommandChannelClientIntegrationTests
             server.Stop();
         }
     }
+    [Fact]
+    public async Task Large_Unicode_Profile_Command_Crosses_The_Named_Pipe_Unchanged()
+    {
+        var baseName = "LocalAdmin-Long-" + Guid.NewGuid().ToString("N");
+        string json = "{\"v\":2,\"label\":\"金色称号\",\"color\":\"yellow\",\"listText\":\"" + new string('金', 4096) + "\",\"hoverText\":\"<b>金色</b>\"}";
+        string command = "/pbadge profile setsaved 76561198000000000@steam " + Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(json));
+        Assert.True(command.Length > 8192);
+        var received = new List<string>();
+        CommandChannelServer? server = null;
+        server = new CommandChannelServer(baseName, 7777, line =>
+        {
+            received.Add(line);
+            server!.Broadcast(">>> " + line);
+            server.Broadcast(line.StartsWith("echo ctl-", StringComparison.Ordinal)
+                ? "ECHO#Echo response: " + line.Substring(5) : "profile accepted");
+        });
+        var output = new StringWriter(); var error = new StringWriter();
+        server.Start();
+        try
+        {
+            int result = await CommandChannelClient.SendAsync(new CommandChannelClientOptions(
+                7777, command, baseName, null, 2000, 0, 5000), output, error);
+            Assert.Equal(0, result);
+            Assert.Equal(command, received[0]);
+            Assert.Equal(string.Empty, error.ToString());
+            Assert.Contains("profile accepted", output.ToString());
+        }
+        finally { server.Stop(); }
+    }
+
 }
