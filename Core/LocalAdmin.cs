@@ -33,7 +33,7 @@ namespace LocalAdmin.V2.Core;
 
 public sealed class LocalAdmin : IDisposable, Policy.IRestartHost, IActivationHost
 {
-    public const string VersionString = "2.5.17";
+    public const string VersionString = "2.5.18";
     private const ushort DefaultPort = 7777;
 
     private static readonly ConcurrentQueue<string> InputQueue = new();
